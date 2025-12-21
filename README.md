@@ -39,7 +39,7 @@ Example:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/polymarket-bot.git
+git clone https://github.com/giral24/polymarket-bot.git
 cd polymarket-bot
 
 # Create virtual environment
