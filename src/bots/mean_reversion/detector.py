@@ -192,6 +192,17 @@ class PriceMovementDetector:
 
         change = (current - baseline) / baseline
 
+        # Log significant movements (>2%) for debugging
+        if abs(change) >= 0.02:
+            self.logger.debug(
+                "price_movement",
+                token_id=tracker.token_id[:20] + "...",
+                change=f"{change:.2%}",
+                baseline=f"{baseline:.3f}",
+                current=f"{current:.3f}",
+                threshold=f"{self.price_change_threshold:.0%}",
+            )
+
         # Check if change exceeds threshold
         if abs(change) < self.price_change_threshold:
             return
