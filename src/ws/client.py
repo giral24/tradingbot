@@ -339,8 +339,7 @@ class WebSocketClient:
         if event_type == "book":
             await self._handle_orderbook(data)
         elif event_type == "price_change":
-            # Price change events - could add callback for these
-            pass
+            await self._handle_price_change(data)
         elif event_type == "tick_size_change":
             pass
         else:
@@ -391,6 +390,37 @@ class WebSocketClient:
 
         except Exception as e:
             self.logger.error("ws_orderbook_parse_error", error=str(e), data=data)
+
+    async def _handle_price_change(self, data: dict[str, Any]) -> None:
+        """
+        Handle price change event.
+
+        These are incremental updates with new price info.
+        """
+        try:
+            # Extract price from the event
+            asset_id = data.get("asset_id", "")
+            price = data.get("price")
+
+            if not asset_id or price is None:
+                return
+
+            # Create a minimal update with just the price
+            # Use price as both bid and ask (it's the last trade price)
+            price_float = float(price)
+            update = OrderBookUpdate(
+                asset_id=asset_id,
+                market=data.get("market", ""),
+                timestamp=int(data.get("timestamp", 0)),
+                bids=[(price_float, 0)],  # Price as bid
+                asks=[(price_float, 0)],  # Price as ask
+            )
+
+            if self.on_orderbook:
+                self.on_orderbook(update)
+
+        except Exception as e:
+            self.logger.error("ws_price_change_error", error=str(e))
 
     async def _ping_loop(self) -> None:
         """Send periodic pings to keep connection alive."""
