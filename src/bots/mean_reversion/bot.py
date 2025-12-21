@@ -149,6 +149,7 @@ class MeanReversionBot(BaseBot):
     SLIPPAGE = 0.01  # 1% slippage on entry/exit
     MIN_HOLD_SECONDS = 10  # Minimum 10 seconds before exit
     MARKET_COOLDOWN_SECONDS = 300  # 5 min cooldown per market after closing
+    SPIKE_CONFIRMATION_SECONDS = 3  # Wait 3 seconds to confirm spike is real
 
     def __init__(
         self,
@@ -179,6 +180,7 @@ class MeanReversionBot(BaseBot):
         self._positions: dict[str, Position] = {}  # token_id -> Position
         self._market_tokens: dict[str, tuple[str, str]] = {}  # condition_id -> (token_a, token_b)
         self._market_cooldowns: dict[str, datetime] = {}  # condition_id -> cooldown_until
+        self._pending_spikes: dict[str, tuple[PriceSpike, datetime, float]] = {}  # token_id -> (spike, detect_time, initial_price)
 
         # Stats
         self._spikes_detected = 0
@@ -339,6 +341,9 @@ class MeanReversionBot(BaseBot):
             if self._ws_task is None or self._ws_task.done():
                 self._ws_task = asyncio.create_task(self.ws_client.run())
 
+        # Check pending spikes for confirmation (3 second delay)
+        await self._check_pending_spikes()
+
         # Check positions for exit conditions
         await self._check_positions()
 
@@ -360,6 +365,76 @@ class MeanReversionBot(BaseBot):
             self._last_status_log = now
 
         await asyncio.sleep(0.1)
+
+    async def _check_pending_spikes(self) -> None:
+        """Check pending spikes and confirm if price is still at spike level after 3 seconds."""
+        if not self.detector:
+            return
+
+        now = datetime.utcnow()
+        to_remove = []
+        to_confirm = []
+
+        for token_id, (spike, detect_time, initial_price) in self._pending_spikes.items():
+            elapsed = (now - detect_time).total_seconds()
+
+            # Not ready yet
+            if elapsed < self.SPIKE_CONFIRMATION_SECONDS:
+                continue
+
+            # Get current price
+            tracker = self.detector._trackers.get(token_id)
+            if not tracker or not tracker.last_price:
+                to_remove.append(token_id)
+                continue
+
+            current_price = tracker.last_price
+            baseline = tracker.baseline_price or spike.price_before
+
+            # Check if spike is still valid (price still significantly different from baseline)
+            # The price should still be at least halfway to the spike level
+            if spike.direction == "down":
+                # For down spike: price dropped, we want to buy expecting recovery
+                # Confirm if price is still below baseline by at least half the original spike
+                min_threshold = baseline * (1 - abs(spike.price_change) / 2)
+                is_still_valid = current_price <= min_threshold
+            else:
+                # For up spike: price rose, we want to short expecting drop
+                # Confirm if price is still above baseline by at least half the original spike
+                min_threshold = baseline * (1 + abs(spike.price_change) / 2)
+                is_still_valid = current_price >= min_threshold
+
+            if is_still_valid:
+                self.logger.info(
+                    "spike_confirmed",
+                    token_id=token_id[:20] + "...",
+                    direction=spike.direction,
+                    initial_price=f"{initial_price:.3f}",
+                    current_price=f"{current_price:.3f}",
+                    baseline=f"{baseline:.3f}",
+                    elapsed_seconds=f"{elapsed:.1f}",
+                )
+                to_confirm.append((token_id, spike))
+            else:
+                self.logger.info(
+                    "spike_rejected_price_reverted",
+                    token_id=token_id[:20] + "...",
+                    direction=spike.direction,
+                    initial_price=f"{initial_price:.3f}",
+                    current_price=f"{current_price:.3f}",
+                    baseline=f"{baseline:.3f}",
+                    elapsed_seconds=f"{elapsed:.1f}",
+                )
+                to_remove.append(token_id)
+
+        # Remove rejected spikes
+        for token_id in to_remove:
+            del self._pending_spikes[token_id]
+
+        # Confirm valid spikes and open positions
+        for token_id, spike in to_confirm:
+            del self._pending_spikes[token_id]
+            await self._open_position(spike)
 
     def _on_orderbook_update(self, update) -> None:
         """Handle orderbook update from WebSocket."""
@@ -396,22 +471,33 @@ class MeanReversionBot(BaseBot):
             self.metrics.inc("orderbook_updates")
 
     def _on_spike_detected(self, spike: PriceSpike) -> None:
-        """Handle detected price spike."""
+        """Handle detected price spike - add to pending for confirmation."""
         self._spikes_detected += 1
 
+        # Skip if already pending or has position
+        if spike.token_to_buy in self._pending_spikes:
+            return
+        if spike.token_to_buy in self._positions:
+            return
+
         self.logger.info(
-            "spike_detected",
+            "spike_detected_pending_confirmation",
             condition_id=spike.condition_id[:20] + "...",
             direction=spike.direction,
             change=f"{spike.price_change:.2%}",
             token_to_buy=spike.token_to_buy[:20] + "...",
+            confirmation_seconds=self.SPIKE_CONFIRMATION_SECONDS,
         )
 
         if self.metrics:
             self.metrics.inc("spikes_detected")
 
-        # Open position
-        asyncio.create_task(self._open_position(spike))
+        # Add to pending spikes - will be confirmed after SPIKE_CONFIRMATION_SECONDS
+        self._pending_spikes[spike.token_to_buy] = (
+            spike,
+            datetime.utcnow(),
+            spike.price_after,  # Initial price at detection
+        )
 
     async def _open_position(self, spike: PriceSpike) -> None:
         """Open a new mean reversion position."""
