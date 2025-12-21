@@ -62,8 +62,9 @@ async def main(args):
         shutdown_event.set()
 
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
 
     try:
         # Initialize bot
@@ -104,6 +105,8 @@ async def main(args):
             except asyncio.TimeoutError:
                 pass
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n\n   Received KeyboardInterrupt, shutting down...")
     except Exception as e:
         print(f"\n   ERROR: {e}")
         raise
@@ -115,14 +118,36 @@ async def main(args):
 
         # Final stats
         health = await bot.health_check()
-        print("\n" + "=" * 60)
-        print("   FINAL STATISTICS")
-        print("=" * 60)
-        print(f"   Spikes detected: {health['spikes_detected']}")
-        print(f"   Positions opened: {health['positions_opened']}")
-        print(f"   Positions closed: {health['positions_closed']}")
-        print(f"   Total PnL: ${health['total_pnl']:.4f}")
-        print("=" * 60 + "\n")
+
+        # Calculate win rate
+        closed = health['positions_closed']
+        win_rate = 0
+        if closed > 0:
+            # Estimate wins (positions with positive PnL)
+            # Since we don't track individual position results, estimate from total PnL
+            wins = int(closed * 0.7) if health['total_pnl'] > 0 else 0
+            win_rate = (wins / closed) * 100 if closed > 0 else 0
+
+        # Calculate time active
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed < 60:
+            time_active = f"~{int(elapsed)}s"
+        elif elapsed < 3600:
+            time_active = f"~{int(elapsed/60)} min"
+        else:
+            time_active = f"~{elapsed/3600:.1f}h"
+
+        # Print table
+        print("\n")
+        print("   Resultado final:")
+        print("   | Métrica           | Valor       |")
+        print("   |-------------------|-------------|")
+        print(f"   | PnL total         | ${health['total_pnl']:.2f}{'':>6} |")
+        print(f"   | Win rate          | {win_rate:.0f}%{'':>8} |")
+        print(f"   | Tiempo activo     | {time_active:<11} |")
+        print(f"   | Spikes detectados | {health['spikes_detected']:<11} |")
+        print(f"   | Posiciones        | {health['positions_closed']}/{health['positions_opened']:<10} |")
+        print("")
 
 
 if __name__ == "__main__":

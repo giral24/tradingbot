@@ -68,8 +68,9 @@ async def main(args):
         shutdown_event.set()
 
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
 
     try:
         # Initialize bot
@@ -111,6 +112,8 @@ async def main(args):
             except asyncio.TimeoutError:
                 pass
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\n\n   Received KeyboardInterrupt, shutting down...")
     except Exception as e:
         print(f"\n   ERROR: {e}")
         raise
