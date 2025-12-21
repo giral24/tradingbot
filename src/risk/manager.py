@@ -7,6 +7,7 @@ Handles:
 - Partial fill management
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -40,6 +41,9 @@ class MarketPosition:
     condition_id: str
     position_a: Position | None = None
     position_b: Position | None = None
+    closed: bool = False
+    close_reason: str = ""  # "resolved" or ""
+    realized_pnl: float = 0.0
 
     @property
     def is_hedged(self) -> bool:
@@ -106,7 +110,8 @@ class RiskManager:
         self.logger = structlog.get_logger(__name__)
 
         # Position tracking
-        self._positions: dict[str, MarketPosition] = {}
+        self._positions: dict[str, MarketPosition] = {}  # Active positions
+        self._closed_positions: deque[MarketPosition] = deque(maxlen=50)  # History of resolved positions
 
         # Stats
         self._total_trades = 0
@@ -275,7 +280,13 @@ class RiskManager:
             profit=profit,
         )
 
-        # Remove position
+        # Mark position as closed and move to history
+        market_pos.closed = True
+        market_pos.close_reason = "resolved"
+        market_pos.realized_pnl = profit
+        self._closed_positions.append(market_pos)
+
+        # Remove from active positions
         del self._positions[condition_id]
 
         return profit

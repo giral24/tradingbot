@@ -6,6 +6,7 @@ and trades the opposite direction, expecting price to revert.
 """
 
 import asyncio
+from collections import deque
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -177,7 +178,8 @@ class MeanReversionBot(BaseBot):
         # State
         self._ws_task: asyncio.Task | None = None
         self._last_watchlist_refresh: datetime | None = None
-        self._positions: dict[str, Position] = {}  # token_id -> Position
+        self._positions: dict[str, Position] = {}  # token_id -> Position (open positions)
+        self._closed_positions: deque[Position] = deque(maxlen=50)  # Keep last 50 closed positions
         self._market_tokens: dict[str, tuple[str, str]] = {}  # condition_id -> (token_a, token_b)
         self._market_cooldowns: dict[str, datetime] = {}  # condition_id -> cooldown_until
         self._pending_spikes: dict[str, tuple[PriceSpike, datetime, float]] = {}  # token_id -> (spike, detect_time, initial_price)
@@ -736,14 +738,47 @@ class MeanReversionBot(BaseBot):
         if self.detector:
             self.detector.clear_spike(position.spike.token_id)
 
-        # Remove from active positions
+        # Move from active to closed positions
         if position.token_id in self._positions:
+            # Add to closed positions history
+            self._closed_positions.append(position)
+            # Remove from active positions
             del self._positions[position.token_id]
+
+    def _serialize_position(self, position: Position) -> dict[str, Any]:
+        """Serialize a position for TUI display."""
+        return {
+            "condition_id": position.condition_id,
+            "token_id": position.token_id,
+            "closed": position.closed,
+            "close_reason": position.close_reason,
+            "pnl": position.pnl,
+            "total_size_usd": position.total_size_usd,
+            "total_tokens": position.total_tokens,
+            "avg_entry_price": position.avg_entry_price,
+            "target_price": position.target_price,
+            "stop_loss_price": position.stop_loss_price,
+            "entries_made": position.entries_made,
+            "max_entries": position.max_entries,
+            "timeout_at": position.timeout_at.isoformat(),
+            "spike_direction": position.spike.direction,  # Already a string
+            "spike_magnitude": position.spike.price_change,  # Use price_change, not magnitude
+            "entries": position.entries,
+        }
 
     async def health_check(self) -> dict[str, Any]:
         """Return bot health status."""
         detector_stats = self.detector.get_stats() if self.detector else {}
         ws_connected = self.ws_client.connected if self.ws_client else False
+
+        # Serialize open positions (from _positions dict)
+        open_positions = [self._serialize_position(p) for p in self._positions.values()]
+
+        # Serialize closed positions (from _closed_positions deque, newest first)
+        closed_positions = [
+            self._serialize_position(p)
+            for p in reversed(self._closed_positions)
+        ]
 
         return {
             "name": self.name,
@@ -752,9 +787,11 @@ class MeanReversionBot(BaseBot):
             "trade_size": self.trade_size,
             "ws_connected": ws_connected,
             "tokens_tracked": detector_stats.get("tokens_tracked", 0),
-            "active_positions": len([p for p in self._positions.values() if not p.closed]),
+            "active_positions": len(open_positions),
             "spikes_detected": self._spikes_detected,
             "positions_opened": self._positions_opened,
             "positions_closed": self._positions_closed,
             "total_pnl": self._total_pnl,
+            "open_positions": open_positions,
+            "closed_positions": closed_positions,
         }

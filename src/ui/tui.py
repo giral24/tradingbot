@@ -4,7 +4,9 @@ Terminal User Interface (TUI) display for trading bots using Rich.
 
 import asyncio
 import os
+import select
 import sys
+import threading
 from collections import deque
 from datetime import datetime
 from typing import Any
@@ -24,6 +26,14 @@ from src.ui.components import (
     format_uptime,
     truncate_address,
 )
+
+# Try to import keyboard handling
+try:
+    import termios
+    import tty
+    KEYBOARD_AVAILABLE = True
+except ImportError:
+    KEYBOARD_AVAILABLE = False
 
 
 # Event emojis for operations log
@@ -73,6 +83,12 @@ class TUIDisplay:
         self._live_context: Live | None = None
         self._render_errors = 0
 
+        # Navigation state
+        self._cursor_position = 0  # Index in all positions list (open + closed)
+        self._expanded_positions: set[str] = set()  # Set of expanded position token_ids
+        self._keyboard_thread: threading.Thread | None = None
+        self._keyboard_stop = threading.Event()
+
         # Setup console
         self.console = self._create_console()
 
@@ -110,6 +126,51 @@ class TUIDisplay:
 
         return False
 
+    def _keyboard_listener(self) -> None:
+        """Listen for keyboard input in a separate thread."""
+        if not KEYBOARD_AVAILABLE or not sys.stdin.isatty():
+            return
+
+        # Save terminal settings
+        old_settings = termios.tcgetattr(sys.stdin)
+
+        try:
+            tty.setcbreak(sys.stdin.fileno())
+
+            while not self._keyboard_stop.is_set():
+                if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                    char = sys.stdin.read(1)
+                    self._handle_key(char)
+
+        finally:
+            # Restore terminal settings
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+    def _handle_key(self, char: str) -> None:
+        """Handle keyboard input."""
+        open_positions = self._last_health.get("open_positions", [])
+        closed_positions = self._last_health.get("closed_positions", [])
+        all_positions = open_positions + closed_positions
+
+        if not all_positions:
+            return
+
+        if char in ("j", "\x1b[B"):  # j or down arrow
+            self._cursor_position = min(self._cursor_position + 1, len(all_positions) - 1)
+        elif char in ("k", "\x1b[A"):  # k or up arrow
+            self._cursor_position = max(self._cursor_position - 1, 0)
+        elif char in (" ", "\n", "\r"):  # space or enter
+            # Toggle expanded state for current position
+            if 0 <= self._cursor_position < len(all_positions):
+                token_id = all_positions[self._cursor_position]["token_id"]
+                if token_id in self._expanded_positions:
+                    self._expanded_positions.remove(token_id)
+                else:
+                    self._expanded_positions.add(token_id)
+        elif char == "q":
+            # Quit signal (could be handled by main loop)
+            pass
+
     async def start(self, bot: BaseBot) -> None:
         """
         Start the TUI in a background task.
@@ -121,11 +182,22 @@ class TUIDisplay:
         self.start_time = asyncio.get_event_loop().time()
         self._stop_event = asyncio.Event()
 
+        # Start keyboard listener thread
+        if KEYBOARD_AVAILABLE:
+            self._keyboard_stop.clear()
+            self._keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
+            self._keyboard_thread.start()
+
         # Start TUI update loop in background
         self._live_task = asyncio.create_task(self._run_tui_loop())
 
     async def stop(self) -> None:
         """Stop TUI gracefully."""
+        # Stop keyboard thread
+        if self._keyboard_thread and self._keyboard_thread.is_alive():
+            self._keyboard_stop.set()
+            self._keyboard_thread.join(timeout=1.0)
+
         if self._stop_event:
             self._stop_event.set()
 
@@ -401,80 +473,184 @@ class TUIDisplay:
 
         return table
 
+    def _build_position_line(
+        self,
+        position: dict[str, Any],
+        is_selected: bool,
+        is_expanded: bool,
+    ) -> list[Text]:
+        """
+        Build display lines for a single position.
+
+        Args:
+            position: Position data dict
+            is_selected: Whether this position is selected by cursor
+            is_expanded: Whether this position is expanded
+
+        Returns:
+            List of Text lines to display
+        """
+        lines = []
+
+        # Main line (always shown)
+        token_id = truncate_address(position["token_id"])
+        pnl = position.get("pnl", 0.0)
+        pnl_text = format_pnl(pnl)
+        size = position.get("total_size_usd", 0.0)
+        entries = position.get("entries_made", 0)
+
+        # Status indicator
+        if position.get("closed"):
+            reason = position.get("close_reason", "unknown")
+            status_emoji = {"target_reached": "🎯", "stop_loss": "🛑", "timeout": "⏱️"}.get(reason, "✅")
+            status_text = reason.replace("_", " ").upper()
+        else:
+            status_emoji = "📈"
+            status_text = "OPEN"
+
+        # Build main line
+        main_line = Text()
+
+        # Cursor indicator
+        if is_selected:
+            main_line.append("▶ ", style="bold yellow")
+        else:
+            main_line.append("  ", style="dim")
+
+        # Status and token
+        main_line.append(f"{status_emoji} ", style="white")
+        main_line.append(f"{token_id}", style="cyan")
+        main_line.append(" | ", style="dim")
+
+        # PnL
+        main_line.append(pnl_text)
+        main_line.append(" | ", style="dim")
+
+        # Size and entries
+        main_line.append(f"${size:.1f}", style="white")
+        main_line.append(f" ({entries}x)", style="dim")
+        main_line.append(" | ", style="dim")
+
+        # Status
+        main_line.append(status_text, style="yellow" if not position.get("closed") else "dim")
+
+        # Expansion indicator
+        if is_expanded:
+            main_line.append(" ▼", style="dim")
+        else:
+            main_line.append(" ▶", style="dim")
+
+        lines.append(main_line)
+
+        # Expanded details (if expanded)
+        if is_expanded:
+            # Check if this is an arbitrage position (has position_a/position_b)
+            if "position_a" in position or "position_b" in position:
+                # Arbitrage position details
+                details = []
+                details.append(f"  Hedged: {'Yes' if position.get('is_hedged', False) else 'No'}")
+                details.append(f"  Expected Profit: ${position.get('expected_profit', 0):.2f}")
+                details.append(f"  Unhedged Size: {position.get('unhedged_size', 0):.4f}")
+
+                if "position_a" in position:
+                    pos_a = position["position_a"]
+                    details.append(f"  Side A: {truncate_address(pos_a['token_id'])}")
+                    details.append(f"    Size: {pos_a['size']:.4f} @ ${pos_a['entry_price']:.4f}")
+                    details.append(f"    Cost: ${pos_a['cost']:.2f}")
+
+                if "position_b" in position:
+                    pos_b = position["position_b"]
+                    details.append(f"  Side B: {truncate_address(pos_b['token_id'])}")
+                    details.append(f"    Size: {pos_b['size']:.4f} @ ${pos_b['entry_price']:.4f}")
+                    details.append(f"    Cost: ${pos_b['cost']:.2f}")
+
+                for detail in details:
+                    detail_line = Text()
+                    detail_line.append(detail, style="dim")
+                    lines.append(detail_line)
+            else:
+                # Mean reversion position details
+                details = []
+                details.append(f"  Avg Entry: ${position.get('avg_entry_price', 0):.4f}")
+                details.append(f"  Target: ${position.get('target_price', 0):.4f}")
+                details.append(f"  Stop Loss: ${position.get('stop_loss_price', 0):.4f}")
+                details.append(f"  Total Tokens: {position.get('total_tokens', 0):.4f}")
+
+                if position.get('spike_direction'):
+                    details.append(f"  Spike: {position.get('spike_direction', 'N/A')} {position.get('spike_magnitude', 0):.1%}")
+
+                for detail in details:
+                    detail_line = Text()
+                    detail_line.append(detail, style="dim")
+                    lines.append(detail_line)
+
+        return lines
+
     def _build_operations_panel(self) -> Panel:
         """
-        Build scrolling operations log panel.
+        Build positions panel with open/closed sections.
 
         Returns:
             Operations Panel
         """
-        if not self._log_entries:
+        open_positions = self._last_health.get("open_positions", [])
+        closed_positions = self._last_health.get("closed_positions", [])
+        all_positions = open_positions + closed_positions
+
+        if not all_positions:
             return Panel(
                 Text("Esperando operaciones...", style="dim"),
-                title="📝 OPERACIONES",
+                title="📊 POSICIONES",
                 border_style="cyan",
+                subtitle="[dim]↑↓/jk: navegar | Space/Enter: expandir | q: salir[/dim]",
             )
 
-        # Build log lines (newest first)
-        log_lines = []
-        for entry in reversed(self._log_entries):
-            # Format timestamp and event
-            timestamp = entry["timestamp"]
-            level = entry["level"]
-            event = entry["event"]
-            emoji = entry["emoji"]
-            context = entry["context"]
+        # Ensure cursor is in valid range
+        if self._cursor_position >= len(all_positions):
+            self._cursor_position = len(all_positions) - 1
+        if self._cursor_position < 0:
+            self._cursor_position = 0
 
-            # Level color
-            level_style = {
-                "DEBUG": "dim",
-                "INFO": "white",
-                "WARNING": "yellow",
-                "ERROR": "bold red",
-                "CRITICAL": "bold red",
-            }.get(level, "white")
+        lines = []
 
-            # Event name (pretty format)
-            event_display = event.replace("_", " ").upper()
+        # Open positions section
+        if open_positions:
+            header = Text()
+            header.append("╔═══ ABIERTAS ", style="bold green")
+            header.append(f"({len(open_positions)})", style="dim")
+            header.append(" ═══", style="bold green")
+            lines.append(header)
+            lines.append(Text())  # Empty line
 
-            # Main line
-            line = Text()
-            line.append(f"{timestamp} ", style="dim")
-            line.append(f"{emoji} ", style="white")
-            line.append(f"{event_display}", style=level_style)
-            log_lines.append(line)
+            for i, pos in enumerate(open_positions):
+                is_selected = i == self._cursor_position
+                is_expanded = pos["token_id"] in self._expanded_positions
+                pos_lines = self._build_position_line(pos, is_selected, is_expanded)
+                lines.extend(pos_lines)
 
-            # Context lines (indented)
-            if context:
-                for key, value in context.items():
-                    # Skip dry_run context (too noisy)
-                    if key == "dry_run":
-                        continue
+            lines.append(Text())  # Empty line
 
-                    # Format value
-                    if isinstance(value, float):
-                        if "pnl" in key or "profit" in key:
-                            value_str = f"${value:.2f}"
-                        elif "price" in key or "spread" in key:
-                            value_str = f"{value:.4f}"
-                        else:
-                            value_str = f"{value:.2f}"
-                    elif isinstance(value, str) and value.startswith("0x"):
-                        value_str = truncate_address(value)
-                    else:
-                        value_str = str(value)
+        # Closed positions section
+        if closed_positions:
+            header = Text()
+            header.append("╚═══ CERRADAS ", style="bold blue")
+            header.append(f"({len(closed_positions)})", style="dim")
+            header.append(" ═══", style="bold blue")
+            lines.append(header)
+            lines.append(Text())  # Empty line
 
-                    # Add context line
-                    context_line = Text()
-                    context_line.append("  ", style="dim")
-                    context_line.append(f"{key}: ", style="cyan")
-                    context_line.append(value_str, style="white")
-                    log_lines.append(context_line)
+            for i, pos in enumerate(closed_positions):
+                cursor_index = len(open_positions) + i
+                is_selected = cursor_index == self._cursor_position
+                is_expanded = pos["token_id"] in self._expanded_positions
+                pos_lines = self._build_position_line(pos, is_selected, is_expanded)
+                lines.extend(pos_lines)
 
         return Panel(
-            Group(*log_lines),
-            title="📝 OPERACIONES",
+            Group(*lines),
+            title="📊 POSICIONES",
             border_style="cyan",
+            subtitle="[dim]↑↓/jk: navegar | Space/Enter: expandir | q: salir[/dim]",
         )
 
     def _build_status_bar(self) -> Text:

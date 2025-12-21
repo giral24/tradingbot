@@ -377,11 +377,67 @@ class ArbIntramarketBot(BaseBot):
                 condition_id=opp.condition_id,
             )
 
+    def _serialize_market_position(self, market_pos: Any) -> dict[str, Any]:
+        """Serialize a market position for TUI display."""
+        # Use realized PnL if closed, otherwise expected profit
+        pnl = market_pos.realized_pnl if market_pos.closed else market_pos.expected_profit
+
+        result = {
+            "condition_id": market_pos.condition_id,
+            "token_id": market_pos.condition_id[:42],  # Use condition_id as token_id for display
+            "closed": market_pos.closed,
+            "close_reason": market_pos.close_reason,
+            "is_hedged": market_pos.is_hedged,
+            "total_size_usd": market_pos.total_cost,
+            "expected_profit": market_pos.expected_profit,
+            "unhedged_size": market_pos.unhedged_size,
+            "pnl": pnl,
+            "entries_made": 2 if market_pos.position_a and market_pos.position_b else 1,
+            "avg_entry_price": 0.0,  # Not applicable for arbitrage
+            "target_price": 0.0,  # Not applicable
+            "stop_loss_price": 0.0,  # Not applicable
+        }
+
+        if market_pos.position_a:
+            result["position_a"] = {
+                "token_id": market_pos.position_a.token_id,
+                "side": market_pos.position_a.side,
+                "size": market_pos.position_a.size,
+                "entry_price": market_pos.position_a.entry_price,
+                "cost": market_pos.position_a.cost,
+                "entry_time": market_pos.position_a.entry_time.isoformat(),
+            }
+
+        if market_pos.position_b:
+            result["position_b"] = {
+                "token_id": market_pos.position_b.token_id,
+                "side": market_pos.position_b.side,
+                "size": market_pos.position_b.size,
+                "entry_price": market_pos.position_b.entry_price,
+                "cost": market_pos.position_b.cost,
+                "entry_time": market_pos.position_b.entry_time.isoformat(),
+            }
+
+        return result
+
     async def health_check(self) -> dict[str, Any]:
         """Return bot health status."""
         ws_connected = self.ws_client.connected if self.ws_client else False
         orderbook_stats = self.orderbook_manager.get_stats() if self.orderbook_manager else {}
         risk_stats = self.risk_manager.get_stats() if self.risk_manager else {}
+
+        # Serialize positions from risk manager
+        open_positions = []
+        closed_positions = []
+
+        if self.risk_manager:
+            # Serialize open positions
+            for market_pos in self.risk_manager._positions.values():
+                open_positions.append(self._serialize_market_position(market_pos))
+
+            # Serialize closed positions (newest first)
+            for market_pos in reversed(self.risk_manager._closed_positions):
+                closed_positions.append(self._serialize_market_position(market_pos))
 
         return {
             "name": self.name,
@@ -397,9 +453,12 @@ class ArbIntramarketBot(BaseBot):
             "trades_executed": self._trades_executed,
             "total_profit": self._total_profit,
             # Risk stats
-            "open_positions": risk_stats.get("open_positions", 0),
+            "active_positions": risk_stats.get("open_positions", 0),
             "hedged_positions": risk_stats.get("hedged_positions", 0),
             "total_exposure": risk_stats.get("total_exposure", 0),
             "unhedged_exposure": risk_stats.get("unhedged_exposure", 0),
             "blocked_by_risk": risk_stats.get("blocked_by_risk", 0),
+            # Position lists for TUI
+            "open_positions": open_positions,
+            "closed_positions": closed_positions,
         }
