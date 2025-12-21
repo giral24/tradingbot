@@ -396,28 +396,31 @@ class WebSocketClient:
         Handle price change event.
 
         These are incremental updates with new price info.
+        Format: {"market": "...", "price_changes": [{"asset_id": "...", "price": "0.5"}, ...], ...}
         """
         try:
-            # Extract price from the event
-            asset_id = data.get("asset_id", "")
-            price = data.get("price")
+            price_changes = data.get("price_changes", [])
+            market = data.get("market", "")
+            timestamp = int(data.get("timestamp", 0))
 
-            if not asset_id or price is None:
-                return
+            for change in price_changes:
+                asset_id = change.get("asset_id", "")
+                price = change.get("price")
 
-            # Create a minimal update with just the price
-            # Use price as both bid and ask (it's the last trade price)
-            price_float = float(price)
-            update = OrderBookUpdate(
-                asset_id=asset_id,
-                market=data.get("market", ""),
-                timestamp=int(data.get("timestamp", 0)),
-                bids=[(price_float, 0)],  # Price as bid
-                asks=[(price_float, 0)],  # Price as ask
-            )
+                if not asset_id or price is None:
+                    continue
 
-            if self.on_orderbook:
-                self.on_orderbook(update)
+                price_float = float(price)
+                update = OrderBookUpdate(
+                    asset_id=asset_id,
+                    market=market,
+                    timestamp=timestamp,
+                    bids=[(price_float, 0)],
+                    asks=[(price_float, 0)],
+                )
+
+                if self.on_orderbook:
+                    self.on_orderbook(update)
 
         except Exception as e:
             self.logger.error("ws_price_change_error", error=str(e))

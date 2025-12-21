@@ -345,6 +345,18 @@ class MeanReversionBot(BaseBot):
             # Update detector (may trigger spike detection)
             self.detector.update_price(token_id, best_ask)
 
+            # Log for debugging (after update)
+            is_tracked = token_id in self.detector._trackers
+            if is_tracked:
+                tracker = self.detector._trackers[token_id]
+                self.logger.debug(
+                    "price_update_received",
+                    token_id=token_id[:20] + "...",
+                    price=f"{best_ask:.3f}",
+                    baseline=f"{tracker.baseline_price:.3f}" if tracker.baseline_price else "None",
+                    history_len=len(tracker.history),
+                )
+
             # Check if we have position to update
             if token_id in self._positions:
                 self._positions[token_id].current_price = best_ask
