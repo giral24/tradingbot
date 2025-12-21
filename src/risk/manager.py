@@ -39,6 +39,7 @@ class MarketPosition:
     """Combined position for both sides of a market."""
 
     condition_id: str
+    market_name: str = ""  # Human-readable market name
     position_a: Position | None = None
     position_b: Position | None = None
     closed: bool = False
@@ -164,6 +165,7 @@ class RiskManager:
         side: str,  # "A" or "B"
         size: float,
         price: float,
+        market_name: str = "",
     ) -> None:
         """
         Record a filled order.
@@ -174,12 +176,16 @@ class RiskManager:
             side: "A" or "B"
             size: Fill size
             price: Fill price
+            market_name: Human-readable market name (optional)
         """
         self._total_trades += 1
 
         # Get or create market position
         if condition_id not in self._positions:
-            self._positions[condition_id] = MarketPosition(condition_id=condition_id)
+            self._positions[condition_id] = MarketPosition(
+                condition_id=condition_id,
+                market_name=market_name,
+            )
 
         market_pos = self._positions[condition_id]
 

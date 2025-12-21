@@ -30,6 +30,7 @@ class Position:
     condition_id: str
     token_id: str
     spike: PriceSpike
+    market_name: str = ""  # Human-readable market name
 
     # Entry info
     entries: list[dict] = field(default_factory=list)  # [{price, size_usd, tokens, timestamp}]
@@ -181,6 +182,7 @@ class MeanReversionBot(BaseBot):
         self._positions: dict[str, Position] = {}  # token_id -> Position (open positions)
         self._closed_positions: deque[Position] = deque(maxlen=50)  # Keep last 50 closed positions
         self._market_tokens: dict[str, tuple[str, str]] = {}  # condition_id -> (token_a, token_b)
+        self._markets: dict[str, str] = {}  # condition_id -> market_name (question)
         self._market_cooldowns: dict[str, datetime] = {}  # condition_id -> cooldown_until
         self._pending_spikes: dict[str, tuple[PriceSpike, datetime, float]] = {}  # token_id -> (spike, detect_time, initial_price)
 
@@ -312,6 +314,7 @@ class MeanReversionBot(BaseBot):
                     token_b_id=m.token_b_id,
                 )
                 self._market_tokens[m.condition_id] = (m.token_a_id, m.token_b_id)
+                self._markets[m.condition_id] = m.question  # Store market name
                 new_tokens.add(m.token_a_id)
                 new_tokens.add(m.token_b_id)
 
@@ -521,10 +524,12 @@ class MeanReversionBot(BaseBot):
 
         # Create position
         now = datetime.utcnow()
+        market_name = self._markets.get(spike.condition_id, "Unknown Market")
         position = Position(
             condition_id=spike.condition_id,
             token_id=spike.token_to_buy,
             spike=spike,
+            market_name=market_name,
             target_price=spike.target_price,
             stop_loss_price=spike.stop_loss_price,
             timeout_at=now + timedelta(minutes=self.POSITION_TIMEOUT_MINUTES),
@@ -750,6 +755,7 @@ class MeanReversionBot(BaseBot):
         return {
             "condition_id": position.condition_id,
             "token_id": position.token_id,
+            "market_name": position.market_name,
             "closed": position.closed,
             "close_reason": position.close_reason,
             "pnl": position.pnl,
@@ -780,6 +786,9 @@ class MeanReversionBot(BaseBot):
             for p in reversed(self._closed_positions)
         ]
 
+        # Calculate total capital invested (sum of open positions)
+        total_invested = sum(p.total_size_usd for p in self._positions.values())
+
         return {
             "name": self.name,
             "is_running": self.is_running,
@@ -792,6 +801,7 @@ class MeanReversionBot(BaseBot):
             "positions_opened": self._positions_opened,
             "positions_closed": self._positions_closed,
             "total_pnl": self._total_pnl,
+            "total_invested": total_invested,
             "open_positions": open_positions,
             "closed_positions": closed_positions,
         }

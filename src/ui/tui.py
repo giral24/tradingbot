@@ -128,23 +128,56 @@ class TUIDisplay:
 
     def _keyboard_listener(self) -> None:
         """Listen for keyboard input in a separate thread."""
-        if not KEYBOARD_AVAILABLE or not sys.stdin.isatty():
+        if not KEYBOARD_AVAILABLE:
+            return
+
+        if not sys.stdin.isatty():
             return
 
         # Save terminal settings
-        old_settings = termios.tcgetattr(sys.stdin)
+        try:
+            old_settings = termios.tcgetattr(sys.stdin)
+        except Exception:
+            return
 
         try:
             tty.setcbreak(sys.stdin.fileno())
 
             while not self._keyboard_stop.is_set():
-                if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
-                    char = sys.stdin.read(1)
-                    self._handle_key(char)
+                try:
+                    if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                        char = sys.stdin.read(1)
 
+                        # Handle escape sequences (arrow keys, etc.)
+                        if char == '\x1b':
+                            # Read next characters to form complete escape sequence
+                            # Check if more input is available
+                            if sys.stdin in select.select([sys.stdin], [], [], 0.05)[0]:
+                                next_char = sys.stdin.read(1)
+                                if next_char == '[':
+                                    # Read direction key
+                                    if sys.stdin in select.select([sys.stdin], [], [], 0.05)[0]:
+                                        direction = sys.stdin.read(1)
+                                        char = '\x1b[' + direction
+                                    else:
+                                        char = '\x1b['
+                                else:
+                                    char = '\x1b' + next_char
+
+                        self._handle_key(char)
+                except Exception:
+                    # Don't crash the keyboard listener on errors
+                    pass
+
+        except Exception:
+            # Failed to set up keyboard listener
+            pass
         finally:
             # Restore terminal settings
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 
     def _handle_key(self, char: str) -> None:
         """Handle keyboard input."""
@@ -182,14 +215,16 @@ class TUIDisplay:
         self.start_time = asyncio.get_event_loop().time()
         self._stop_event = asyncio.Event()
 
-        # Start keyboard listener thread
+        # Start TUI update loop in background
+        self._live_task = asyncio.create_task(self._run_tui_loop())
+
+        # Start keyboard listener thread after a short delay
+        # This allows Rich Live to initialize first
         if KEYBOARD_AVAILABLE:
+            await asyncio.sleep(0.5)
             self._keyboard_stop.clear()
             self._keyboard_thread = threading.Thread(target=self._keyboard_listener, daemon=True)
             self._keyboard_thread.start()
-
-        # Start TUI update loop in background
-        self._live_task = asyncio.create_task(self._run_tui_loop())
 
     async def stop(self) -> None:
         """Stop TUI gracefully."""
@@ -447,7 +482,7 @@ class TUIDisplay:
         table.add_row("Trades", Text(str(trades), style="white"))
 
         # Open Positions
-        open_pos = self._last_health.get("open_positions", 0)
+        open_pos = self._last_health.get("active_positions", 0)
         table.add_row("Open Positions", Text(str(open_pos), style="white"))
 
         # Hedged
@@ -473,6 +508,137 @@ class TUIDisplay:
 
         return table
 
+    def _build_position_table(
+        self,
+        positions: list[dict[str, Any]],
+        section_name: str,
+        cursor_offset: int,
+    ) -> Table:
+        """
+        Build a table for displaying positions.
+
+        Args:
+            positions: List of position data dicts
+            section_name: Name of the section ("OPEN" or "CLOSED")
+            cursor_offset: Offset for cursor position calculation
+
+        Returns:
+            Rich Table
+        """
+        # Create table
+        table = Table(
+            show_header=True,
+            header_style="bold cyan",
+            box=None,
+            padding=(0, 1),
+            collapse_padding=True,
+        )
+
+        # Add columns with fixed widths
+        table.add_column("", width=1, no_wrap=True)  # Cursor
+        table.add_column("Status", width=2, no_wrap=True)  # Emoji
+        table.add_column("Market", max_width=40)  # Market name
+        table.add_column("PnL", width=10, justify="right", no_wrap=True)
+        table.add_column("Size", width=12, justify="right", no_wrap=True)
+        table.add_column("Status", width=15, no_wrap=True)
+
+        # Add rows
+        for i, position in enumerate(positions):
+            cursor_index = cursor_offset + i
+            is_selected = cursor_index == self._cursor_position
+            is_expanded = position["token_id"] in self._expanded_positions
+
+            # Get data
+            market_name = position.get("market_name", "")
+            if market_name:
+                display_name = market_name[:40] + "..." if len(market_name) > 40 else market_name
+            else:
+                display_name = truncate_address(position["token_id"])
+
+            pnl = position.get("pnl", 0.0)
+            pnl_text = format_pnl(pnl)
+            size = position.get("total_size_usd", 0.0)
+            entries = position.get("entries_made", 0)
+
+            # Status indicator
+            if position.get("closed"):
+                reason = position.get("close_reason", "unknown")
+                status_emoji = {"target_reached": "🎯", "stop_loss": "🛑", "timeout": "⏱️"}.get(reason, "✅")
+                status_text = reason.replace("_", " ").upper()
+                status_style = "dim"
+            else:
+                status_emoji = "📈"
+                status_text = "OPEN"
+                status_style = "yellow"
+
+            # Cursor indicator
+            cursor = Text(">", style="bold yellow") if is_selected else Text(" ")
+
+            # Status emoji
+            emoji = Text(status_emoji)
+
+            # Market name (with expand indicator)
+            market = Text(display_name, style="cyan")
+            if is_expanded:
+                market.append(" ▼", style="dim")
+            else:
+                market.append(" ▶", style="dim")
+
+            # Size with entries
+            size_text = Text(f"${size:.1f} ", style="white")
+            size_text.append(f"({entries}x)", style="dim")
+
+            # Status text
+            status = Text(status_text, style=status_style)
+
+            table.add_row(cursor, emoji, market, pnl_text, size_text, status)
+
+            # Add expanded details if needed
+            if is_expanded:
+                self._add_expanded_details(table, position)
+
+        return table
+
+    def _add_expanded_details(self, table: Table, position: dict[str, Any]) -> None:
+        """Add expanded details rows to table."""
+        # Check if this is an arbitrage position (has position_a/position_b)
+        if "position_a" in position or "position_b" in position:
+            # Arbitrage position details
+            details = []
+            details.append(f"  Hedged: {'Yes' if position.get('is_hedged', False) else 'No'}")
+            details.append(f"  Expected Profit: ${position.get('expected_profit', 0):.2f}")
+            details.append(f"  Unhedged Size: {position.get('unhedged_size', 0):.4f}")
+
+            if "position_a" in position:
+                pos_a = position["position_a"]
+                details.append(f"  Side A: {truncate_address(pos_a['token_id'])}")
+                details.append(f"    Size: {pos_a['size']:.4f} @ ${pos_a['entry_price']:.4f}")
+                details.append(f"    Cost: ${pos_a['cost']:.2f}")
+
+            if "position_b" in position:
+                pos_b = position["position_b"]
+                details.append(f"  Side B: {truncate_address(pos_b['token_id'])}")
+                details.append(f"    Size: {pos_b['size']:.4f} @ ${pos_b['entry_price']:.4f}")
+                details.append(f"    Cost: ${pos_b['cost']:.2f}")
+
+            for detail in details:
+                detail_text = Text(detail, style="dim")
+                table.add_row("", "", detail_text, "", "", "")
+        else:
+            # Mean reversion position details
+            details = []
+            details.append(f"  Avg Entry: ${position.get('avg_entry_price', 0):.4f}")
+            details.append(f"  Target: ${position.get('target_price', 0):.4f}")
+            details.append(f"  Stop Loss: ${position.get('stop_loss_price', 0):.4f}")
+            details.append(f"  Total Tokens: {position.get('total_tokens', 0):.4f}")
+
+            if position.get('spike_direction'):
+                details.append(f"  Spike: {position.get('spike_direction', 'N/A')} {position.get('spike_magnitude', 0):.1%}")
+
+            for detail in details:
+                detail_text = Text(detail, style="dim")
+                table.add_row("", "", detail_text, "", "", "")
+
     def _build_position_line(
         self,
         position: dict[str, Any],
@@ -480,7 +646,7 @@ class TUIDisplay:
         is_expanded: bool,
     ) -> list[Text]:
         """
-        Build display lines for a single position.
+        Build display lines for a single position (legacy method for compatibility).
 
         Args:
             position: Position data dict
@@ -493,7 +659,13 @@ class TUIDisplay:
         lines = []
 
         # Main line (always shown)
-        token_id = truncate_address(position["token_id"])
+        # Use market name if available, otherwise fall back to truncated token_id
+        market_name = position.get("market_name", "")
+        if market_name:
+            display_name = market_name[:50] + "..." if len(market_name) > 50 else market_name
+        else:
+            display_name = truncate_address(position["token_id"])
+
         pnl = position.get("pnl", 0.0)
         pnl_text = format_pnl(pnl)
         size = position.get("total_size_usd", 0.0)
@@ -517,9 +689,9 @@ class TUIDisplay:
         else:
             main_line.append("  ", style="dim")
 
-        # Status and token
+        # Status and market name
         main_line.append(f"{status_emoji} ", style="white")
-        main_line.append(f"{token_id}", style="cyan")
+        main_line.append(f"{display_name}", style="cyan")
         main_line.append(" | ", style="dim")
 
         # PnL
@@ -596,13 +768,17 @@ class TUIDisplay:
         open_positions = self._last_health.get("open_positions", [])
         closed_positions = self._last_health.get("closed_positions", [])
         all_positions = open_positions + closed_positions
+        total_invested = self._last_health.get("total_invested", 0.0)
+
+        # Build title with invested capital
+        title = f"📊 POSICIONES (${total_invested:.2f})"
 
         if not all_positions:
             return Panel(
                 Text("Esperando operaciones...", style="dim"),
-                title="📊 POSICIONES",
+                title=title,
                 border_style="cyan",
-                subtitle="[dim]↑↓/jk: navegar | Space/Enter: expandir | q: salir[/dim]",
+                subtitle="[dim]j/k o ↑↓: navegar | Space/Enter: expandir | q: salir[/dim]",
             )
 
         # Ensure cursor is in valid range
@@ -611,7 +787,7 @@ class TUIDisplay:
         if self._cursor_position < 0:
             self._cursor_position = 0
 
-        lines = []
+        content_items = []
 
         # Open positions section
         if open_positions:
@@ -619,16 +795,13 @@ class TUIDisplay:
             header.append("╔═══ ABIERTAS ", style="bold green")
             header.append(f"({len(open_positions)})", style="dim")
             header.append(" ═══", style="bold green")
-            lines.append(header)
-            lines.append(Text())  # Empty line
+            content_items.append(header)
+            content_items.append(Text())  # Empty line
 
-            for i, pos in enumerate(open_positions):
-                is_selected = i == self._cursor_position
-                is_expanded = pos["token_id"] in self._expanded_positions
-                pos_lines = self._build_position_line(pos, is_selected, is_expanded)
-                lines.extend(pos_lines)
-
-            lines.append(Text())  # Empty line
+            # Build table for open positions
+            open_table = self._build_position_table(open_positions, "OPEN", 0)
+            content_items.append(open_table)
+            content_items.append(Text())  # Empty line
 
         # Closed positions section
         if closed_positions:
@@ -636,21 +809,18 @@ class TUIDisplay:
             header.append("╚═══ CERRADAS ", style="bold blue")
             header.append(f"({len(closed_positions)})", style="dim")
             header.append(" ═══", style="bold blue")
-            lines.append(header)
-            lines.append(Text())  # Empty line
+            content_items.append(header)
+            content_items.append(Text())  # Empty line
 
-            for i, pos in enumerate(closed_positions):
-                cursor_index = len(open_positions) + i
-                is_selected = cursor_index == self._cursor_position
-                is_expanded = pos["token_id"] in self._expanded_positions
-                pos_lines = self._build_position_line(pos, is_selected, is_expanded)
-                lines.extend(pos_lines)
+            # Build table for closed positions
+            closed_table = self._build_position_table(closed_positions, "CLOSED", len(open_positions))
+            content_items.append(closed_table)
 
         return Panel(
-            Group(*lines),
-            title="📊 POSICIONES",
+            Group(*content_items),
+            title=title,
             border_style="cyan",
-            subtitle="[dim]↑↓/jk: navegar | Space/Enter: expandir | q: salir[/dim]",
+            subtitle="[dim]j/k o ↑↓: navegar | Space/Enter: expandir | q: salir[/dim]",
         )
 
     def _build_status_bar(self) -> Text:

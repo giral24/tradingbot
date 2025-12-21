@@ -287,6 +287,13 @@ class ArbIntramarketBot(BaseBot):
         if not self.clob_client or not self.risk_manager:
             return
 
+        # Get market name from watchlist
+        market_name = ""
+        if self.watchlist:
+            entry = self.watchlist.get_entry(opp.condition_id)
+            if entry:
+                market_name = entry.question
+
         # Calculate sizes
         size = min(self.trade_size, opp.max_size)
 
@@ -313,10 +320,10 @@ class ArbIntramarketBot(BaseBot):
             self.logger.info("dry_run_trade_skipped")
             # Record fills for risk tracking even in dry run
             self.risk_manager.record_fill(
-                opp.condition_id, opp.token_a_id, "A", size, opp.ask_a
+                opp.condition_id, opp.token_a_id, "A", size, opp.ask_a, market_name
             )
             self.risk_manager.record_fill(
-                opp.condition_id, opp.token_b_id, "B", size, opp.ask_b
+                opp.condition_id, opp.token_b_id, "B", size, opp.ask_b, market_name
             )
             self._trades_executed += 1
             self._total_profit += opp.profit_per_pair * size
@@ -335,7 +342,7 @@ class ArbIntramarketBot(BaseBot):
             # Record fill for token A
             if order_a:
                 self.risk_manager.record_fill(
-                    opp.condition_id, opp.token_a_id, "A", size, opp.ask_a
+                    opp.condition_id, opp.token_a_id, "A", size, opp.ask_a, market_name
                 )
 
             # Order 2: Buy token B at ask_b
@@ -349,7 +356,7 @@ class ArbIntramarketBot(BaseBot):
             # Record fill for token B
             if order_b:
                 self.risk_manager.record_fill(
-                    opp.condition_id, opp.token_b_id, "B", size, opp.ask_b
+                    opp.condition_id, opp.token_b_id, "B", size, opp.ask_b, market_name
                 )
 
             self._trades_executed += 1
@@ -385,6 +392,7 @@ class ArbIntramarketBot(BaseBot):
         result = {
             "condition_id": market_pos.condition_id,
             "token_id": market_pos.condition_id[:42],  # Use condition_id as token_id for display
+            "market_name": market_pos.market_name,
             "closed": market_pos.closed,
             "close_reason": market_pos.close_reason,
             "is_hedged": market_pos.is_hedged,
@@ -429,11 +437,13 @@ class ArbIntramarketBot(BaseBot):
         # Serialize positions from risk manager
         open_positions = []
         closed_positions = []
+        total_invested = 0.0
 
         if self.risk_manager:
             # Serialize open positions
             for market_pos in self.risk_manager._positions.values():
                 open_positions.append(self._serialize_market_position(market_pos))
+                total_invested += market_pos.total_cost
 
             # Serialize closed positions (newest first)
             for market_pos in reversed(self.risk_manager._closed_positions):
@@ -452,6 +462,7 @@ class ArbIntramarketBot(BaseBot):
             "opportunities_found": self._opportunities_found,
             "trades_executed": self._trades_executed,
             "total_profit": self._total_profit,
+            "total_invested": total_invested,
             # Risk stats
             "active_positions": risk_stats.get("open_positions", 0),
             "hedged_positions": risk_stats.get("hedged_positions", 0),
