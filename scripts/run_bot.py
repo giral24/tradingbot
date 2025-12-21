@@ -27,30 +27,63 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import setup_logging, settings
 from src.bots.arb_intramarket import ArbIntramarketBot
 
+# Try to import TUI components (graceful fallback if not available)
+try:
+    from src.ui import TUIDisplay, configure_tui_logging
+    TUI_AVAILABLE = True
+except ImportError:
+    TUI_AVAILABLE = False
+
 
 async def main(args):
     """Run the arbitrage bot."""
 
-    # Setup logging
+    # Determine if TUI should be enabled (enabled by default unless --no-tui is used)
+    enable_tui = TUI_AVAILABLE and not args.no_tui
+
+    # Setup logging and TUI
     log_level = "DEBUG" if args.verbose else "INFO"
-    setup_logging(level=log_level, format="console")
+    tui_display = None
 
-    print("\n" + "=" * 60)
-    print("   POLYMARKET ARBITRAGE BOT")
-    print("=" * 60)
-    print(f"\n   Mode: {'DRY RUN (no real trades)' if args.dry_run else 'LIVE TRADING'}")
-    print(f"   Trade size: ${args.trade_size}")
-    print(f"   Min spread: {args.min_spread * 100:.2f}%")
-    print(f"   Duration: {args.duration}s" if args.duration else "   Duration: unlimited")
-    print("\n" + "=" * 60 + "\n")
+    if enable_tui:
+        try:
+            tui_display = TUIDisplay(
+                bot_name="ARBITRAGE BOT",
+                bot_mode="DRY RUN" if args.dry_run else "LIVE",
+                refresh_rate=0.5,
+                max_log_lines=20,
+            )
 
-    if not args.dry_run:
-        print("   ⚠️  WARNING: Live trading mode!")
-        print("   Make sure you have configured your PRIVATE_KEY in .env")
-        print()
-        if not settings.private_key:
-            print("   ERROR: PRIVATE_KEY not set. Please configure .env")
-            return
+            # Configure logging to route to TUI
+            configure_tui_logging(tui_display, level=log_level)
+
+        except Exception as e:
+            print(f"Failed to initialize TUI: {e}")
+            print("Falling back to console logging...")
+            setup_logging(level=log_level, format="console")
+            tui_display = None
+    else:
+        # Use standard console logging
+        setup_logging(level=log_level, format="console")
+
+    # Show banner only if not using TUI
+    if not tui_display:
+        print("\n" + "=" * 60)
+        print("   POLYMARKET ARBITRAGE BOT")
+        print("=" * 60)
+        print(f"\n   Mode: {'DRY RUN (no real trades)' if args.dry_run else 'LIVE TRADING'}")
+        print(f"   Trade size: ${args.trade_size}")
+        print(f"   Min spread: {args.min_spread * 100:.2f}%")
+        print(f"   Duration: {args.duration}s" if args.duration else "   Duration: unlimited")
+        print("\n" + "=" * 60 + "\n")
+
+        if not args.dry_run:
+            print("   ⚠️  WARNING: Live trading mode!")
+            print("   Make sure you have configured your PRIVATE_KEY in .env")
+            print()
+            if not settings.private_key:
+                print("   ERROR: PRIVATE_KEY not set. Please configure .env")
+                return
 
     # Create bot
     bot = ArbIntramarketBot(
@@ -74,13 +107,18 @@ async def main(args):
 
     try:
         # Initialize bot
-        print("   Initializing bot...")
+        if not tui_display:
+            print("   Initializing bot...")
         await bot.initialize()
 
-        health = await bot.health_check()
-        print(f"   Watchlist: {health['watchlist_size']} markets")
-        print(f"   Tokens: {health['tokens_subscribed']}")
-        print("\n   Bot running. Press Ctrl+C to stop.\n")
+        # Start TUI if enabled
+        if tui_display:
+            await tui_display.start(bot)
+        else:
+            health = await bot.health_check()
+            print(f"   Watchlist: {health['watchlist_size']} markets")
+            print(f"   Tokens: {health['tokens_subscribed']}")
+            print("\n   Bot running. Press Ctrl+C to stop.\n")
 
         # Start bot
         bot._is_running = True
@@ -113,17 +151,24 @@ async def main(args):
                 pass
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\n\n   Received KeyboardInterrupt, shutting down...")
+        if not tui_display:
+            print("\n\n   Received KeyboardInterrupt, shutting down...")
     except Exception as e:
-        print(f"\n   ERROR: {e}")
+        if not tui_display:
+            print(f"\n   ERROR: {e}")
         raise
 
     finally:
+        # Stop TUI first
+        if tui_display:
+            await tui_display.stop()
+
         # Shutdown
-        print("\n   Shutting down...")
+        if not tui_display:
+            print("\n   Shutting down...")
         await bot.shutdown()
 
-        # Final stats
+        # Final stats (show after TUI stops)
         health = await bot.health_check()
         print("\n" + "=" * 60)
         print("   FINAL STATISTICS")
@@ -176,6 +221,11 @@ if __name__ == "__main__":
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
+    )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="Disable TUI and use standard console logging",
     )
 
     args = parser.parse_args()

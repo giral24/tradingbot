@@ -27,23 +27,56 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import setup_logging
 from src.bots.mean_reversion import MeanReversionBot
 
+# Try to import TUI components (graceful fallback if not available)
+try:
+    from src.ui import TUIDisplay, configure_tui_logging
+    TUI_AVAILABLE = True
+except ImportError:
+    TUI_AVAILABLE = False
+
 
 async def main(args):
     """Run the mean reversion bot."""
 
-    # Setup logging
-    log_level = "DEBUG" if args.verbose else "INFO"
-    setup_logging(level=log_level, format="console")
+    # Determine if TUI should be enabled (enabled by default unless --no-tui is used)
+    enable_tui = TUI_AVAILABLE and not args.no_tui
 
-    print("\n" + "=" * 60)
-    print("   MEAN REVERSION BOT")
-    print("=" * 60)
-    print(f"\n   Mode: {'DRY RUN (no real trades)' if args.dry_run else 'LIVE TRADING'}")
-    print(f"   Trade size: ${args.trade_size} per entry (max 3 entries)")
-    print(f"   Price threshold: {args.threshold * 100:.1f}% movement")
-    print(f"   Liquidity range: ${args.min_liquidity:,} - ${args.max_liquidity:,}")
-    print(f"   Duration: {args.duration}s" if args.duration else "   Duration: unlimited")
-    print("\n" + "=" * 60 + "\n")
+    # Setup logging and TUI
+    log_level = "DEBUG" if args.verbose else "INFO"
+    tui_display = None
+
+    if enable_tui:
+        try:
+            tui_display = TUIDisplay(
+                bot_name="MEAN REVERSION BOT",
+                bot_mode="DRY RUN" if args.dry_run else "LIVE",
+                refresh_rate=0.5,
+                max_log_lines=20,
+            )
+
+            # Configure logging to route to TUI
+            configure_tui_logging(tui_display, level=log_level)
+
+        except Exception as e:
+            print(f"Failed to initialize TUI: {e}")
+            print("Falling back to console logging...")
+            setup_logging(level=log_level, format="console")
+            tui_display = None
+    else:
+        # Use standard console logging
+        setup_logging(level=log_level, format="console")
+
+    # Show banner only if not using TUI
+    if not tui_display:
+        print("\n" + "=" * 60)
+        print("   MEAN REVERSION BOT")
+        print("=" * 60)
+        print(f"\n   Mode: {'DRY RUN (no real trades)' if args.dry_run else 'LIVE TRADING'}")
+        print(f"   Trade size: ${args.trade_size} per entry (max 3 entries)")
+        print(f"   Price threshold: {args.threshold * 100:.1f}% movement")
+        print(f"   Liquidity range: ${args.min_liquidity:,} - ${args.max_liquidity:,}")
+        print(f"   Duration: {args.duration}s" if args.duration else "   Duration: unlimited")
+        print("\n" + "=" * 60 + "\n")
 
     # Create bot
     bot = MeanReversionBot(
@@ -68,12 +101,17 @@ async def main(args):
 
     try:
         # Initialize bot
-        print("   Initializing bot...")
+        if not tui_display:
+            print("   Initializing bot...")
         await bot.initialize()
 
-        health = await bot.health_check()
-        print(f"   Tokens tracked: {health['tokens_tracked']}")
-        print("\n   Bot running. Press Ctrl+C to stop.\n")
+        # Start TUI if enabled
+        if tui_display:
+            await tui_display.start(bot)
+        else:
+            health = await bot.health_check()
+            print(f"   Tokens tracked: {health['tokens_tracked']}")
+            print("\n   Bot running. Press Ctrl+C to stop.\n")
 
         # Start bot
         bot._running = True
@@ -106,14 +144,21 @@ async def main(args):
                 pass
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\n\n   Received KeyboardInterrupt, shutting down...")
+        if not tui_display:
+            print("\n\n   Received KeyboardInterrupt, shutting down...")
     except Exception as e:
-        print(f"\n   ERROR: {e}")
+        if not tui_display:
+            print(f"\n   ERROR: {e}")
         raise
 
     finally:
+        # Stop TUI first
+        if tui_display:
+            await tui_display.stop()
+
         # Shutdown
-        print("\n   Shutting down...")
+        if not tui_display:
+            print("\n   Shutting down...")
         await bot.shutdown()
 
         # Final stats
@@ -201,6 +246,11 @@ if __name__ == "__main__":
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging",
+    )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        help="Disable TUI and use standard console logging",
     )
 
     args = parser.parse_args()
