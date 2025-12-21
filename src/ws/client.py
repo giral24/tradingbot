@@ -218,35 +218,30 @@ class WebSocketClient:
         """
         Unsubscribe from token updates.
 
+        Note: Polymarket CLOB WebSocket does NOT support unsubscribe.
+        We just remove from our tracking set and ignore future updates.
+        The tokens will be fully removed on next reconnection.
+
         Args:
             token_ids: Token IDs to unsubscribe from
 
         Returns:
-            True if unsubscription sent
+            True if removed from tracking
         """
-        if not token_ids or not self._connected or not self._ws:
+        if not token_ids:
             return False
 
-        try:
-            message = {
-                "assets_ids": token_ids,
-                "operation": "unsubscribe",
-            }
+        # Just remove from our tracking - we can't actually unsubscribe
+        # The WebSocket will still send updates but we'll ignore them
+        self._subscribed_tokens -= set(token_ids)
+        self.logger.info(
+            "ws_unsubscribed_local",
+            count=len(token_ids),
+            remaining=len(self._subscribed_tokens),
+            note="Polymarket does not support unsubscribe, will fully remove on reconnect",
+        )
 
-            await self._ws.send(json.dumps(message))
-
-            self._subscribed_tokens -= set(token_ids)
-            self.logger.info(
-                "ws_unsubscribed",
-                count=len(token_ids),
-                remaining=len(self._subscribed_tokens),
-            )
-
-            return True
-
-        except Exception as e:
-            self.logger.error("ws_unsubscribe_failed", error=str(e))
-            return False
+        return True
 
     async def run(self) -> None:
         """

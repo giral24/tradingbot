@@ -66,11 +66,19 @@ class TokenPriceTracker:
     last_price: float | None = None
     baseline_price: float | None = None  # Rolling average
 
+    # Warmup tracking
+    first_price_time: datetime | None = None
+    is_warmed_up: bool = False
+
     def add_price(self, price: float, timestamp: datetime | None = None) -> None:
         """Add a new price observation."""
         ts = timestamp or datetime.utcnow()
         self.history.append(PricePoint(price=price, timestamp=ts))
         self.last_price = price
+
+        # Track first price time for warmup
+        if self.first_price_time is None:
+            self.first_price_time = ts
 
         # Update baseline (average of last 2 minutes, excluding last 10 seconds)
         self._update_baseline()
@@ -81,6 +89,24 @@ class TokenPriceTracker:
             return
 
         now = datetime.utcnow()
+
+        # Warmup: need at least 90 seconds of data before detecting spikes
+        # This ensures we have a stable baseline before detecting movements
+        if self.first_price_time:
+            time_since_start = (now - self.first_price_time).total_seconds()
+            if time_since_start < 90:
+                # Still warming up - don't set baseline yet, wait for stable data
+                return
+            elif not self.is_warmed_up:
+                # Just finished warmup - reset baseline using only recent data (last 30 sec)
+                # This avoids using stale prices from WebSocket initialization
+                self.is_warmed_up = True
+                cutoff = now - timedelta(seconds=30)
+                recent_prices = [p.price for p in self.history if p.timestamp >= cutoff]
+                if recent_prices:
+                    self.baseline_price = sum(recent_prices) / len(recent_prices)
+                return
+
         cutoff_recent = now - timedelta(seconds=10)  # Exclude last 10 seconds
         cutoff_old = now - timedelta(minutes=2)  # Use last 2 minutes
 
@@ -186,6 +212,10 @@ class PriceMovementDetector:
     ) -> None:
         """Check if current price represents a spike from baseline."""
 
+        # Skip if not warmed up (need 30 seconds of data)
+        if not tracker.is_warmed_up:
+            return
+
         # Calculate change
         if baseline == 0:
             return
@@ -207,34 +237,81 @@ class PriceMovementDetector:
         if abs(change) < self.price_change_threshold:
             return
 
-        # Check if we already have an active spike for this token
+        # Reject unrealistic spikes (>30% change is almost certainly bad data)
+        # Real market movements in prediction markets rarely exceed 30% in 2 minutes
+        if abs(change) > 0.30:
+            self.logger.debug(
+                "rejecting_unrealistic_spike",
+                token_id=tracker.token_id[:20] + "...",
+                change=f"{change:.2%}",
+                baseline=f"{baseline:.3f}",
+                current=f"{current:.3f}",
+            )
+            return
+
+        # Check if we already have an active spike for this token OR its complement
+        # (to avoid double-detecting the same market movement)
         if tracker.token_id in self._active_spikes:
+            return
+        if tracker.other_token_id in self._active_spikes:
             return
 
         # Determine direction and what to buy
+        # Key insight: we always buy the token that DROPPED, expecting it to recover
         if change > 0:
-            # Price went UP - buy the OTHER token (it went down)
+            # Token A went UP → Token B went DOWN → Buy Token B
             direction = "up"
             token_to_buy = tracker.other_token_id
-            # Target: price goes back down 50% of the move
-            target_price = current - (current - baseline) * self.recovery_target
-            # Stop loss: price goes up another 5%
-            stop_loss_price = current * (1 + self.stop_loss)
+
+            # Get ACTUAL price of token B from its tracker (not approximation)
+            other_tracker = self._trackers.get(tracker.other_token_id)
+            if not other_tracker or not other_tracker.last_price or not other_tracker.baseline_price:
+                # Can't trade without real price data for the token we want to buy
+                self.logger.debug(
+                    "skip_up_spike_no_other_price",
+                    token_id=tracker.token_id[:20] + "...",
+                    other_token_id=tracker.other_token_id[:20] + "...",
+                )
+                return
+
+            other_current = other_tracker.last_price
+            other_baseline = other_tracker.baseline_price
+
+            # Verify token B actually dropped significantly
+            other_change = (other_current - other_baseline) / other_baseline if other_baseline > 0 else 0
+            if other_change >= -0.03:  # Token B didn't drop enough (at least 3%)
+                return
+
+            # Target: token B recovers 50% of its drop
+            target_price = other_current + (other_baseline - other_current) * self.recovery_target
+
+            # Stop loss: token B drops another 5%
+            stop_loss_price = other_current * (1 - self.stop_loss)
+
+            # Store prices for the token we're buying
+            price_before_for_spike = other_baseline
+            price_after_for_spike = other_current
         else:
-            # Price went DOWN - buy THIS token (it's cheap)
+            # Token A went DOWN → Buy Token A (it's cheap)
             direction = "down"
             token_to_buy = tracker.token_id
+
             # Target: price recovers 50% of the drop
             target_price = current + (baseline - current) * self.recovery_target
-            # Stop loss: price drops another 5%
+
+            # Stop loss: price drops another 5% from current
             stop_loss_price = current * (1 - self.stop_loss)
+
+            # Store prices for the token we're buying (same token)
+            price_before_for_spike = baseline
+            price_after_for_spike = current
 
         # Create spike signal
         spike = PriceSpike(
             condition_id=tracker.condition_id,
-            token_id=tracker.token_id,
-            price_before=baseline,
-            price_after=current,
+            token_id=tracker.token_id,  # Token that triggered detection
+            price_before=price_before_for_spike,  # Baseline of token we're buying
+            price_after=price_after_for_spike,  # Current price of token we're buying
             price_change=change,
             direction=direction,
             token_to_buy=token_to_buy,
@@ -242,19 +319,30 @@ class PriceMovementDetector:
             stop_loss_price=stop_loss_price,
         )
 
-        # Record and signal
+        # Record spike for BOTH tokens to prevent double-detection
         self._active_spikes[tracker.token_id] = spike
+        self._active_spikes[tracker.other_token_id] = spike
         self._spikes_detected += 1
+
+        # For logging, show the price of the token we're buying
+        if direction == "up":
+            log_price_before = other_baseline
+            log_price_after = other_current
+        else:
+            log_price_before = baseline
+            log_price_after = current
 
         self.logger.info(
             "price_spike_detected",
-            condition_id=tracker.condition_id[:20] + "...",
-            token_id=tracker.token_id[:20] + "...",
+            condition_id=tracker.condition_id,  # Full ID
+            token_id=tracker.token_id,  # Full ID
             direction=direction,
             change=f"{change:.2%}",
-            price_before=f"{baseline:.3f}",
-            price_after=f"{current:.3f}",
-            token_to_buy=token_to_buy[:20] + "...",
+            buy_token_price_before=f"{log_price_before:.3f}",
+            buy_token_price_after=f"{log_price_after:.3f}",
+            target=f"{target_price:.3f}",
+            stop_loss=f"{stop_loss_price:.3f}",
+            token_to_buy=token_to_buy,  # Full ID
         )
 
         # Trigger callback
@@ -263,8 +351,21 @@ class PriceMovementDetector:
 
     def clear_spike(self, token_id: str) -> None:
         """Clear an active spike (after trade is closed)."""
-        if token_id in self._active_spikes:
-            del self._active_spikes[token_id]
+        # Get the spike to find the other token in the pair
+        spike = self._active_spikes.get(token_id)
+        if spike:
+            # Clear the spike for all related tokens
+            # spike.token_id = the token that triggered detection
+            # spike.token_to_buy = the token we bought
+            # We also need to find the "other" token in the market
+            tracker = self._trackers.get(spike.token_id)
+            tokens_to_clear = {spike.token_id, spike.token_to_buy}
+            if tracker:
+                tokens_to_clear.add(tracker.other_token_id)
+
+            for t in tokens_to_clear:
+                if t in self._active_spikes:
+                    del self._active_spikes[t]
 
     def get_active_spike(self, token_id: str) -> PriceSpike | None:
         """Get active spike for a token."""

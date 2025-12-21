@@ -19,6 +19,7 @@ from src.ws import WebSocketClient
 from src.metrics import MetricsCollector
 
 from .detector import PriceMovementDetector, PriceSpike
+from .trade_logger import TradeLogger
 
 
 @dataclass
@@ -30,14 +31,18 @@ class Position:
     spike: PriceSpike
 
     # Entry info
-    entries: list[dict] = field(default_factory=list)  # [{price, size, timestamp}]
-    total_size: float = 0.0
+    entries: list[dict] = field(default_factory=list)  # [{price, size_usd, tokens, timestamp}]
+    total_size_usd: float = 0.0  # Total USD invested
+    total_tokens: float = 0.0  # Total tokens bought
     avg_entry_price: float = 0.0
 
     # Targets
     target_price: float = 0.0
     stop_loss_price: float = 0.0
     timeout_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(minutes=30))
+
+    # Minimum hold time (realistic execution)
+    min_exit_time: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(seconds=10))
 
     # Status
     entries_made: int = 0
@@ -46,44 +51,44 @@ class Position:
     close_reason: str = ""
     pnl: float = 0.0
 
-    def add_entry(self, price: float, size: float) -> None:
+    def add_entry(self, price: float, size_usd: float) -> None:
         """Record an entry."""
+        # Calculate tokens bought: size_usd / price
+        tokens = size_usd / price if price > 0 else 0
+
         self.entries.append({
             "price": price,
-            "size": size,
+            "size_usd": size_usd,
+            "tokens": tokens,
             "timestamp": datetime.utcnow(),
         })
         self.entries_made += 1
 
         # Update totals
-        old_total = self.total_size
-        self.total_size += size
+        self.total_size_usd += size_usd
+        self.total_tokens += tokens
 
-        # Update average entry price
-        if self.total_size > 0:
-            self.avg_entry_price = (
-                (self.avg_entry_price * old_total + price * size) / self.total_size
-            )
+        # Update average entry price (weighted by tokens)
+        if self.total_tokens > 0:
+            self.avg_entry_price = self.total_size_usd / self.total_tokens
 
     def should_add_entry(self, current_price: float) -> bool:
-        """Check if we should add another entry."""
+        """Check if we should add another entry (scale in)."""
         if self.entries_made >= self.max_entries:
             return False
         if self.closed:
             return False
 
-        # Add entry if price moved further in our favor (cheaper for us)
-        if self.spike.direction == "up":
-            # We bought the OTHER token - its price should be lower
-            # Add entry if price dropped more
-            return current_price < self.avg_entry_price * 0.98  # 2% cheaper
-        else:
-            # We bought THIS token - add if it dropped more
-            return current_price < self.avg_entry_price * 0.98
+        # Add entry if price dropped further (better entry price for us)
+        # We bought this token expecting it to rise, so lower = better
+        return current_price < self.avg_entry_price * 0.98  # 2% cheaper
 
     def check_exit(self, current_price: float) -> tuple[bool, str]:
         """
         Check if position should be closed.
+
+        We always buy the token that dropped (either directly or the complement),
+        so we expect price to rise toward target.
 
         Returns:
             (should_close, reason)
@@ -91,29 +96,26 @@ class Position:
         if self.closed:
             return False, ""
 
-        # Check timeout
-        if datetime.utcnow() >= self.timeout_at:
+        now = datetime.utcnow()
+
+        # Check timeout (always applies)
+        if now >= self.timeout_at:
             return True, "timeout"
 
-        # Check target (50% recovery)
-        if self.spike.direction == "up":
-            # Price went up, we bought other token
-            # Exit when original token price comes back down
-            if current_price <= self.target_price:
-                return True, "target_reached"
-        else:
-            # Price went down, we bought this token
-            # Exit when price recovers
-            if current_price >= self.target_price:
-                return True, "target_reached"
+        # Minimum hold time - don't exit before 60 seconds (realistic execution)
+        # This prevents reacting to orderbook noise
+        if now < self.min_exit_time:
+            return False, ""
 
-        # Check stop loss
-        if self.spike.direction == "up":
-            if current_price >= self.stop_loss_price:
-                return True, "stop_loss"
-        else:
-            if current_price <= self.stop_loss_price:
-                return True, "stop_loss"
+        # Check target - price recovered to target (goes UP)
+        # We bought low, sell when price rises to target
+        if current_price >= self.target_price:
+            return True, "target_reached"
+
+        # Check stop loss - price dropped further (goes DOWN more)
+        # Exit if price falls below stop loss
+        if current_price <= self.stop_loss_price:
+            return True, "stop_loss"
 
         return False, ""
 
@@ -143,6 +145,11 @@ class MeanReversionBot(BaseBot):
     STOP_LOSS = 0.05  # 5% stop loss
     POSITION_TIMEOUT_MINUTES = 30
 
+    # Realistic execution settings
+    SLIPPAGE = 0.01  # 1% slippage on entry/exit
+    MIN_HOLD_SECONDS = 10  # Minimum 10 seconds before exit
+    MARKET_COOLDOWN_SECONDS = 300  # 5 min cooldown per market after closing
+
     def __init__(
         self,
         trade_size: float = DEFAULT_TRADE_SIZE,
@@ -164,12 +171,14 @@ class MeanReversionBot(BaseBot):
         self.ws_client: WebSocketClient | None = None
         self.detector: PriceMovementDetector | None = None
         self.metrics: MetricsCollector | None = None
+        self.trade_logger: TradeLogger | None = None
 
         # State
         self._ws_task: asyncio.Task | None = None
         self._last_watchlist_refresh: datetime | None = None
         self._positions: dict[str, Position] = {}  # token_id -> Position
         self._market_tokens: dict[str, tuple[str, str]] = {}  # condition_id -> (token_a, token_b)
+        self._market_cooldowns: dict[str, datetime] = {}  # condition_id -> cooldown_until
 
         # Stats
         self._spikes_detected = 0
@@ -209,6 +218,9 @@ class MeanReversionBot(BaseBot):
 
         # Initialize metrics
         self.metrics = MetricsCollector(export_interval=60)
+
+        # Initialize trade logger for verification
+        self.trade_logger = TradeLogger(log_dir="data/trade_logs")
 
         # Initial watchlist refresh
         await self._refresh_watchlist()
@@ -330,6 +342,23 @@ class MeanReversionBot(BaseBot):
         # Check positions for exit conditions
         await self._check_positions()
 
+        # Log estado cada 30 segundos
+        now = datetime.utcnow()
+        if not hasattr(self, '_last_status_log'):
+            self._last_status_log = now
+
+        if (now - self._last_status_log).total_seconds() >= 30:
+            active_positions = len([p for p in self._positions.values() if not p.closed])
+            self.logger.info(
+                "bot_status",
+                spikes=self._spikes_detected,
+                opened=self._positions_opened,
+                closed=self._positions_closed,
+                active=active_positions,
+                total_pnl=f"${self._total_pnl:.2f}",
+            )
+            self._last_status_log = now
+
         await asyncio.sleep(0.1)
 
     def _on_orderbook_update(self, update) -> None:
@@ -345,6 +374,10 @@ class MeanReversionBot(BaseBot):
             # Update detector (may trigger spike detection)
             self.detector.update_price(token_id, best_ask)
 
+            # Log price for tokens with open positions (for verification)
+            if self.trade_logger and token_id in self._positions:
+                self.trade_logger.add_price(token_id, best_ask)
+
             # Log for debugging (after update)
             is_tracked = token_id in self.detector._trackers
             if is_tracked:
@@ -357,9 +390,7 @@ class MeanReversionBot(BaseBot):
                     history_len=len(tracker.history),
                 )
 
-            # Check if we have position to update
-            if token_id in self._positions:
-                self._positions[token_id].current_price = best_ask
+            # Note: position prices are checked in _check_positions using tracker.last_price
 
         if self.metrics:
             self.metrics.inc("orderbook_updates")
@@ -389,25 +420,57 @@ class MeanReversionBot(BaseBot):
             self.logger.debug("position_already_exists", token=spike.token_to_buy[:20])
             return
 
+        # Check market cooldown (avoid rapid re-entry after closing)
+        now = datetime.utcnow()
+        cooldown_until = self._market_cooldowns.get(spike.condition_id)
+        if cooldown_until and now < cooldown_until:
+            self.logger.debug(
+                "market_in_cooldown",
+                condition_id=spike.condition_id[:20] + "...",
+                seconds_left=int((cooldown_until - now).total_seconds()),
+            )
+            return
+
         # Create position
+        now = datetime.utcnow()
         position = Position(
             condition_id=spike.condition_id,
             token_id=spike.token_to_buy,
             spike=spike,
             target_price=spike.target_price,
             stop_loss_price=spike.stop_loss_price,
-            timeout_at=datetime.utcnow() + timedelta(minutes=self.POSITION_TIMEOUT_MINUTES),
+            timeout_at=now + timedelta(minutes=self.POSITION_TIMEOUT_MINUTES),
+            min_exit_time=now + timedelta(seconds=self.MIN_HOLD_SECONDS),
         )
 
         self._positions[spike.token_to_buy] = position
         self._positions_opened += 1
+
+        # Start trade logging for verification
+        if self.trade_logger and self.detector:
+            tracker = self.detector._trackers.get(spike.token_to_buy)
+            price_history = []
+            if tracker:
+                # Get recent price history from detector
+                price_history = [(p.timestamp, p.price) for p in tracker.history]
+
+            self.trade_logger.start_trade(
+                token_id=spike.token_to_buy,
+                condition_id=spike.condition_id,
+                direction=spike.direction,
+                entry_price=spike.price_after,
+                baseline_price=spike.price_before,
+                spike_change=spike.price_change,
+                price_history=price_history,
+                market_question="",  # Could fetch from gamma API
+            )
 
         # Execute first entry
         await self._execute_entry(position)
 
     async def _execute_entry(self, position: Position) -> None:
         """Execute an entry for a position."""
-        if not self.clob_client:
+        if not self.clob_client or not self.detector:
             return
 
         if position.entries_made >= position.max_entries:
@@ -416,11 +479,13 @@ class MeanReversionBot(BaseBot):
         # Calculate entry size (equal splits)
         entry_size = self.trade_size
 
-        # Get current price
-        current_price = position.spike.price_after
-        if position.entries:
-            # Use last known price if available
-            current_price = position.entries[-1]["price"]
+        # Get CURRENT price from detector (not spike price which is stale)
+        tracker = self.detector._trackers.get(position.token_id)
+        if tracker and tracker.last_price:
+            current_price = tracker.last_price
+        else:
+            # Fallback to spike price for first entry
+            current_price = position.spike.price_after
 
         self.logger.info(
             "executing_entry",
@@ -433,9 +498,14 @@ class MeanReversionBot(BaseBot):
         )
 
         if self.is_dry_run:
-            # Simulate entry
-            position.add_entry(current_price, entry_size)
-            self.logger.info("dry_run_entry_simulated")
+            # Simulate entry WITH slippage (we pay more than the displayed price)
+            entry_price_with_slippage = current_price * (1 + self.SLIPPAGE)
+            position.add_entry(entry_price_with_slippage, entry_size)
+            self.logger.info(
+                "dry_run_entry_simulated",
+                orderbook_price=f"{current_price:.3f}",
+                entry_price_with_slippage=f"{entry_price_with_slippage:.3f}",
+            )
             return
 
         try:
@@ -474,6 +544,21 @@ class MeanReversionBot(BaseBot):
 
             current_price = tracker.last_price
 
+            # Sanity check: reject prices that differ too much from entry
+            # This protects against bad data during initialization
+            if position.avg_entry_price > 0:
+                price_diff_ratio = abs(current_price - position.avg_entry_price) / position.avg_entry_price
+                if price_diff_ratio > 0.5:  # More than 50% difference is suspicious
+                    self.logger.warning(
+                        "rejecting_suspicious_price",
+                        token_id=token_id,  # Full ID for debugging
+                        avg_entry=f"{position.avg_entry_price:.3f}",
+                        current_price=f"{current_price:.3f}",
+                        diff_ratio=f"{price_diff_ratio:.2%}",
+                    )
+                    # Skip this price update - wait for more reasonable data
+                    continue
+
             # Check for exit
             should_exit, reason = position.check_exit(current_price)
 
@@ -500,29 +585,48 @@ class MeanReversionBot(BaseBot):
         position.closed = True
         position.close_reason = reason
 
-        # Calculate PnL
-        if position.spike.direction == "up":
-            # We bought the other token expecting original to come down
-            # PnL = (entry_price - current_price) * size (for the other token)
-            position.pnl = (position.avg_entry_price - current_price) * position.total_size
-        else:
-            # We bought this token expecting it to go up
-            position.pnl = (current_price - position.avg_entry_price) * position.total_size
+        # Apply slippage on exit (we sell for less than displayed price)
+        exit_price_with_slippage = current_price * (1 - self.SLIPPAGE)
+
+        # Calculate PnL correctly with slippage:
+        # PnL = (exit_price_with_slippage * tokens) - total_usd_invested
+        exit_value = exit_price_with_slippage * position.total_tokens
+        position.pnl = exit_value - position.total_size_usd
 
         self._total_pnl += position.pnl
         self._positions_closed += 1
 
+        # Set market cooldown
+        self._market_cooldowns[position.condition_id] = (
+            datetime.utcnow() + timedelta(seconds=self.MARKET_COOLDOWN_SECONDS)
+        )
+
+        # Save trade log for verification
+        csv_path = None
+        if self.trade_logger:
+            csv_path = self.trade_logger.close_trade(
+                token_id=position.token_id,
+                exit_price=exit_price_with_slippage,
+                exit_reason=reason,
+                pnl=position.pnl,
+            )
+
+        # Log detallado del cierre
+        profit_emoji = "✅" if position.pnl > 0 else "❌" if position.pnl < 0 else "➖"
         self.logger.info(
             "position_closed",
+            result=profit_emoji,
             condition_id=position.condition_id[:20] + "...",
             token_id=position.token_id[:20] + "...",
             reason=reason,
             entries=position.entries_made,
             avg_entry=f"{position.avg_entry_price:.3f}",
-            exit_price=f"{current_price:.3f}",
+            orderbook_price=f"{current_price:.3f}",
+            exit_price_with_slippage=f"{exit_price_with_slippage:.3f}",
             pnl=f"${position.pnl:.4f}",
             total_pnl=f"${self._total_pnl:.4f}",
             dry_run=self.is_dry_run,
+            log_file=csv_path or "N/A",
         )
 
         if self.metrics:
@@ -532,12 +636,12 @@ class MeanReversionBot(BaseBot):
 
         if not self.is_dry_run:
             try:
-                # Sell position
+                # Sell position (sell all tokens)
                 await self.clob_client.place_order(
                     token_id=position.token_id,
                     side=OrderSide.SELL,
                     price=current_price,
-                    size=position.total_size,
+                    size=position.total_tokens,  # Sell tokens, not USD
                 )
             except Exception as e:
                 self.logger.error("close_execution_error", error=str(e))
