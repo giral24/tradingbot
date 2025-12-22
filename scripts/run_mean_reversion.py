@@ -233,7 +233,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-liquidity",
         type=float,
-        default=100000,
+        default=75000,
         help="Maximum market liquidity (default: 50000)",
     )
     parser.add_argument(

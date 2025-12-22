@@ -66,21 +66,6 @@ SPORTS_KEYWORDS = [
     "game-4", "game-5", "game-6", "game-7", "round-", "set-",
 ]
 
-# Crypto price markets - these track real crypto prices, not order imbalances
-# Mean reversion doesn't work because price changes reflect actual market movements
-CRYPTO_PRICE_KEYWORDS = [
-    "price-of-bitcoin", "price-of-ethereum", "price-of-solana", "price-of-xrp",
-    "price-of-dogecoin", "price-of-cardano", "price-of-bnb", "price-of-avalanche",
-    "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
-    "bitcoin-up-or-down", "ethereum-up-or-down", "solana-up-or-down", "xrp-up-or-down",
-    "will-the-price-of-bitcoin", "will-the-price-of-ethereum",
-    "will-the-price-of-solana", "will-the-price-of-xrp",
-    "bitcoin-above", "bitcoin-below", "bitcoin-between",
-    "ethereum-above", "ethereum-below", "ethereum-between",
-    "solana-above", "solana-below", "solana-between",
-    "xrp-above", "xrp-below", "xrp-between",
-]
-
 
 @dataclass
 class Position:
@@ -195,7 +180,7 @@ class MeanReversionBot(BaseBot):
     # Configuration
     DEFAULT_TRADE_SIZE = 10.0  # $10 per entry (x3 = $30 max per trade)
     MIN_LIQUIDITY = 1000  # $1,000 minimum
-    MAX_LIQUIDITY = 100000  # $100,000 maximum
+    MAX_LIQUIDITY = 75000  # $100,000 maximum
     WATCHLIST_REFRESH_INTERVAL = 300  # 5 minutes
     MAX_WATCHLIST_SIZE = 200
 
@@ -204,11 +189,11 @@ class MeanReversionBot(BaseBot):
     TIME_WINDOW_SECONDS = 120  # 2 minutes
     RECOVERY_TARGET = 0.60  # 60% recovery
     STOP_LOSS = 0.08  # 8% stop loss
-    POSITION_TIMEOUT_MINUTES = 30
+    POSITION_TIMEOUT_MINUTES = 10
 
     # Realistic execution settings
     SLIPPAGE = 0.02  # 2% slippage on entry/exit
-    MIN_HOLD_SECONDS = 10  # Minimum 10 seconds before exit
+    MIN_HOLD_SECONDS = 1  # Minimum 1 second before exit
     MARKET_COOLDOWN_SECONDS_LOSS = 300  # 5 min cooldown after loss
     MARKET_COOLDOWN_SECONDS_WIN = 0  # No cooldown after win
     SPIKE_CONFIRMATION_SECONDS = 0  # No delay - buy immediately on spike detection
@@ -347,14 +332,13 @@ class MeanReversionBot(BaseBot):
                 max_markets=self.MAX_WATCHLIST_SIZE * 3,
             )
 
-            # Filter by liquidity range, binary, exclude live sports and crypto price markets
+            # Filter by liquidity range, binary, and exclude live sports
             filtered = [
                 m for m in markets
                 if m.is_binary
                 and m.accepting_orders
                 and self.min_liquidity <= m.liquidity <= self.max_liquidity
                 and not self._is_live_sports_market(m)
-                and not self._is_crypto_price_market(m)
             ]
 
             # Sort by liquidity (prefer middle of range)
@@ -481,26 +465,6 @@ class MeanReversionBot(BaseBot):
             slug=slug[:40],
         )
         return True
-
-    def _is_crypto_price_market(self, market) -> bool:
-        """
-        Check if a market tracks crypto prices.
-
-        These markets don't work for mean reversion because price changes
-        reflect actual crypto market movements, not temporary order imbalances.
-        """
-        slug = market.market_slug.lower()
-        question = market.question.lower()
-
-        is_crypto_price = any(kw in slug or kw in question for kw in CRYPTO_PRICE_KEYWORDS)
-
-        if is_crypto_price:
-            self.logger.debug(
-                "excluding_crypto_price_market",
-                slug=slug[:40],
-            )
-
-        return is_crypto_price
 
     async def run_fast_loop(self) -> None:
         """Main loop - WebSocket driven."""
