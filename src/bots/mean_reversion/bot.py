@@ -66,6 +66,21 @@ SPORTS_KEYWORDS = [
     "game-4", "game-5", "game-6", "game-7", "round-", "set-",
 ]
 
+# Crypto price markets - these track real crypto prices, not order imbalances
+# Mean reversion doesn't work because price changes reflect actual market movements
+CRYPTO_PRICE_KEYWORDS = [
+    "price-of-bitcoin", "price-of-ethereum", "price-of-solana", "price-of-xrp",
+    "price-of-dogecoin", "price-of-cardano", "price-of-bnb", "price-of-avalanche",
+    "btc-updown", "eth-updown", "sol-updown", "xrp-updown",
+    "bitcoin-up-or-down", "ethereum-up-or-down", "solana-up-or-down", "xrp-up-or-down",
+    "will-the-price-of-bitcoin", "will-the-price-of-ethereum",
+    "will-the-price-of-solana", "will-the-price-of-xrp",
+    "bitcoin-above", "bitcoin-below", "bitcoin-between",
+    "ethereum-above", "ethereum-below", "ethereum-between",
+    "solana-above", "solana-below", "solana-between",
+    "xrp-above", "xrp-below", "xrp-between",
+]
+
 
 @dataclass
 class Position:
@@ -179,22 +194,23 @@ class MeanReversionBot(BaseBot):
 
     # Configuration
     DEFAULT_TRADE_SIZE = 10.0  # $10 per entry (x3 = $30 max per trade)
-    MIN_LIQUIDITY = 2000  # $2,000 minimum (avoid low liquidity noise)
+    MIN_LIQUIDITY = 1000  # $1,000 minimum
     MAX_LIQUIDITY = 100000  # $100,000 maximum
     WATCHLIST_REFRESH_INTERVAL = 300  # 5 minutes
     MAX_WATCHLIST_SIZE = 200
 
     # Detector settings
-    PRICE_CHANGE_THRESHOLD = 0.08  # 8% movement
+    PRICE_CHANGE_THRESHOLD = 0.06  # 6% movement
     TIME_WINDOW_SECONDS = 120  # 2 minutes
-    RECOVERY_TARGET = 0.50  # 50% recovery
-    STOP_LOSS = 0.05  # 5% stop loss
+    RECOVERY_TARGET = 0.60  # 60% recovery
+    STOP_LOSS = 0.08  # 8% stop loss
     POSITION_TIMEOUT_MINUTES = 30
 
     # Realistic execution settings
-    SLIPPAGE = 0.01  # 1% slippage on entry/exit
+    SLIPPAGE = 0.02  # 2% slippage on entry/exit
     MIN_HOLD_SECONDS = 10  # Minimum 10 seconds before exit
-    MARKET_COOLDOWN_SECONDS = 300  # 5 min cooldown per market after closing
+    MARKET_COOLDOWN_SECONDS_LOSS = 300  # 5 min cooldown after loss
+    MARKET_COOLDOWN_SECONDS_WIN = 0  # No cooldown after win
     SPIKE_CONFIRMATION_SECONDS = 0  # No delay - buy immediately on spike detection
 
     def __init__(
@@ -331,13 +347,14 @@ class MeanReversionBot(BaseBot):
                 max_markets=self.MAX_WATCHLIST_SIZE * 3,
             )
 
-            # Filter by liquidity range, binary, and exclude live sports
+            # Filter by liquidity range, binary, exclude live sports and crypto price markets
             filtered = [
                 m for m in markets
                 if m.is_binary
                 and m.accepting_orders
                 and self.min_liquidity <= m.liquidity <= self.max_liquidity
                 and not self._is_live_sports_market(m)
+                and not self._is_crypto_price_market(m)
             ]
 
             # Sort by liquidity (prefer middle of range)
@@ -391,8 +408,6 @@ class MeanReversionBot(BaseBot):
         Mean reversion doesn't work on live sports because price changes
         reflect actual game events (goals, points), not temporary order imbalances.
 
-        Note: Polymarket API returns timestamps in UTC (ISO 8601 with 'Z' suffix).
-
         Returns:
             True if this is a LIVE sports market (should be excluded)
             False if it's not sports OR sports but hasn't started yet
@@ -407,43 +422,85 @@ class MeanReversionBot(BaseBot):
             return False
 
         # It's a sports market - check if it has started
-        # If start_date is in the past, it's potentially live
-        # Note: startDateIso is just a date "2025-12-22", not a full datetime
-        if market.start_date_iso:
-            try:
-                from datetime import date
-                # Parse as simple date (format: "2025-12-22")
-                start_date = date.fromisoformat(market.start_date_iso)
-                today = date.today()
+        now = datetime.utcnow()
 
-                if today > start_date:
-                    # Event date has passed - exclude it (already happened)
+        # Priority 1: Use game_start_time if available (exact time)
+        if market.game_start_time:
+            try:
+                # Parse ISO format: "2025-12-22T19:30:00Z"
+                start_time_str = market.game_start_time.replace("Z", "+00:00")
+                start_time = datetime.fromisoformat(start_time_str).replace(tzinfo=None)
+
+                if now >= start_time:
                     self.logger.debug(
-                        "excluding_past_sports_market",
+                        "excluding_live_sports_market",
                         slug=slug[:40],
-                        start_date=market.start_date_iso,
-                        status="past_event",
+                        game_start_time=market.game_start_time,
+                        status="started",
                     )
                     return True
                 else:
-                    # Event is today or future - allow trading
-                    # Note: We can't know exact start time, so we allow today's events
+                    # Game hasn't started yet - allow trading
                     return False
             except (ValueError, TypeError) as e:
-                # Can't parse date - exclude to be safe
                 self.logger.debug(
-                    "excluding_sports_market_bad_date",
+                    "sports_market_bad_game_time",
                     slug=slug[:40],
                     error=str(e),
                 )
-                return True
+                # Fall through to start_date_iso check
 
-        # No start_date available - exclude to be safe
+        # Priority 2: Use start_date_iso (only date, no time)
+        if market.start_date_iso:
+            try:
+                from datetime import date
+                start_date = date.fromisoformat(market.start_date_iso)
+                today = date.today()
+
+                if today >= start_date:
+                    # Today or past - could be live, exclude to be safe
+                    self.logger.debug(
+                        "excluding_sports_market_today_or_past",
+                        slug=slug[:40],
+                        start_date=market.start_date_iso,
+                    )
+                    return True
+                else:
+                    # Future date - allow trading
+                    return False
+            except (ValueError, TypeError) as e:
+                self.logger.debug(
+                    "sports_market_bad_date",
+                    slug=slug[:40],
+                    error=str(e),
+                )
+
+        # No date info available - exclude to be safe
         self.logger.debug(
-            "excluding_sports_market_missing_start",
+            "excluding_sports_market_no_date",
             slug=slug[:40],
         )
         return True
+
+    def _is_crypto_price_market(self, market) -> bool:
+        """
+        Check if a market tracks crypto prices.
+
+        These markets don't work for mean reversion because price changes
+        reflect actual crypto market movements, not temporary order imbalances.
+        """
+        slug = market.market_slug.lower()
+        question = market.question.lower()
+
+        is_crypto_price = any(kw in slug or kw in question for kw in CRYPTO_PRICE_KEYWORDS)
+
+        if is_crypto_price:
+            self.logger.debug(
+                "excluding_crypto_price_market",
+                slug=slug[:40],
+            )
+
+        return is_crypto_price
 
     async def run_fast_loop(self) -> None:
         """Main loop - WebSocket driven."""
@@ -805,10 +862,16 @@ class MeanReversionBot(BaseBot):
         self._total_pnl += position.pnl
         self._positions_closed += 1
 
-        # Set market cooldown
-        self._market_cooldowns[position.condition_id] = (
-            datetime.utcnow() + timedelta(seconds=self.MARKET_COOLDOWN_SECONDS)
-        )
+        # Set market cooldown: no cooldown if profit, 5 min if loss
+        if position.pnl >= 0:
+            cooldown_seconds = self.MARKET_COOLDOWN_SECONDS_WIN
+        else:
+            cooldown_seconds = self.MARKET_COOLDOWN_SECONDS_LOSS
+
+        if cooldown_seconds > 0:
+            self._market_cooldowns[position.condition_id] = (
+                datetime.utcnow() + timedelta(seconds=cooldown_seconds)
+            )
 
         # Save trade log for verification
         csv_path = None
@@ -920,6 +983,8 @@ class MeanReversionBot(BaseBot):
             "trade_size": self.trade_size,
             "ws_connected": ws_connected,
             "tokens_tracked": detector_stats.get("tokens_tracked", 0),
+            "tokens_warmed_up": detector_stats.get("tokens_warmed_up", 0),
+            "tokens_active": detector_stats.get("tokens_active", 0),
             "active_positions": len(open_positions),
             "spikes_detected": self._spikes_detected,
             "positions_opened": self._positions_opened,

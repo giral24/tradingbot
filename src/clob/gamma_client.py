@@ -67,6 +67,7 @@ class GammaMarket:
     # Timing
     end_date_iso: str | None
     start_date_iso: str | None
+    game_start_time: str | None  # Exact start time for sports (ISO format)
 
     @property
     def is_binary(self) -> bool:
@@ -202,6 +203,7 @@ class GammaApiClient:
                 best_ask=best_ask,
                 end_date_iso=m.get("endDateIso"),
                 start_date_iso=m.get("startDateIso"),
+                game_start_time=m.get("gameStartTime"),
             ))
 
         self.logger.debug(

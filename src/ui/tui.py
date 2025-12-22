@@ -474,9 +474,13 @@ class TUIDisplay:
         ws_connected = self._last_health.get("ws_connected", False)
         table.add_row("WS Status", create_connection_indicator(ws_connected))
 
-        # Tokens
-        tokens = self._last_health.get("tokens_tracked", 0)
-        table.add_row("Tokens", Text(str(tokens), style="white"))
+        # Tokens: total / warmed up / active
+        tokens_total = self._last_health.get("tokens_tracked", 0)
+        tokens_warmed = self._last_health.get("tokens_warmed_up", 0)
+        tokens_active = self._last_health.get("tokens_active", 0)
+        table.add_row("Tokens", Text(str(tokens_total), style="white"))
+        table.add_row("  Ready", Text(str(tokens_warmed), style="green" if tokens_warmed > 0 else "yellow"))
+        table.add_row("  Active", Text(str(tokens_active), style="cyan" if tokens_active > 0 else "dim"))
 
         return table
 
