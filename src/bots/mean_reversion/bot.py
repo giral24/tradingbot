@@ -180,7 +180,7 @@ class MeanReversionBot(BaseBot):
     # Configuration
     DEFAULT_TRADE_SIZE = 10.0  # $10 per entry (x3 = $30 max per trade)
     MIN_LIQUIDITY = 1000  # $1,000 minimum
-    MAX_LIQUIDITY = 75000  # $100,000 maximum
+    MAX_LIQUIDITY = 100000  # $100,000 maximum
     WATCHLIST_REFRESH_INTERVAL = 300  # 5 minutes
     MAX_WATCHLIST_SIZE = 200
 
@@ -188,12 +188,12 @@ class MeanReversionBot(BaseBot):
     PRICE_CHANGE_THRESHOLD = 0.06  # 6% movement
     TIME_WINDOW_SECONDS = 120  # 2 minutes
     RECOVERY_TARGET = 0.60  # 60% recovery
-    STOP_LOSS = 0.08  # 8% stop loss
+    STOP_LOSS = 0.10  # 10% stop loss
     POSITION_TIMEOUT_MINUTES = 10
 
     # Realistic execution settings
-    SLIPPAGE = 0.02  # 2% slippage on entry/exit
-    MIN_HOLD_SECONDS = 1  # Minimum 1 second before exit
+    SLIPPAGE = 0.01  # 2% slippage on entry/exit
+    MIN_HOLD_SECONDS = 5  # Minimum 10 seconds before exit
     MARKET_COOLDOWN_SECONDS_LOSS = 300  # 5 min cooldown after loss
     MARKET_COOLDOWN_SECONDS_WIN = 0  # No cooldown after win
     SPIKE_CONFIRMATION_SECONDS = 0  # No delay - buy immediately on spike detection
