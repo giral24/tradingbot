@@ -22,6 +22,50 @@ from src.metrics import MetricsCollector
 from .detector import PriceMovementDetector, PriceSpike
 from .trade_logger import TradeLogger
 
+# Sports keywords to identify live sports markets (mean reversion doesn't work on these)
+# Timestamps from Polymarket API are in UTC (ISO 8601 with 'Z' suffix)
+SPORTS_KEYWORDS = [
+    # === ESPORTS ===
+    "dota", "dota2", "lol", "league-of-legends", "csgo", "cs2", "valorant",
+    "esports", "esport", "overwatch", "mobile-legends", "honor-of-kings",
+    "rainbow-six", "call-of-duty", "rocket-league",
+
+    # === AMERICAN SPORTS ===
+    # Football
+    "nfl", "cfb", "college-football", "super-bowl", "touchdown",
+    # Basketball
+    "nba", "wnba", "ncaa", "cbb", "cwbb", "euroleague", "basketball",
+    # Baseball
+    "mlb", "kbo", "baseball",
+    # Hockey
+    "nhl", "shl", "ahl", "khl", "del", "extraliga", "snl", "hockey",
+
+    # === SOCCER/FOOTBALL ===
+    "soccer", "football", "epl", "premier-league", "la-liga", "laliga",
+    "bundesliga", "serie-a", "ligue-1", "mls", "ucl", "uel",
+    "champions-league", "europa-league", "eredivisie", "liga-mx",
+    "super-lig", "primeira-liga", "a-league", "fa-cup", "efl",
+    "fifa", "wc-qualifiers", "world-cup",
+
+    # === COMBAT SPORTS ===
+    "ufc", "boxing", "mma", "fight", "bellator", "pfl",
+
+    # === INDIVIDUAL SPORTS ===
+    "tennis", "atp", "wta", "wimbledon", "us-open", "french-open", "australian-open",
+    "golf", "pga", "lpga", "masters",
+    "f1", "formula-1", "formula1", "nascar", "motogp", "racing",
+
+    # === OTHER SPORTS ===
+    "cricket", "t20", "odi", "test-match", "ipl",
+    "chess",
+    "sailing", "sailgp",
+    "olympics",
+
+    # === COMMON PATTERNS FOR LIVE EVENTS ===
+    "-vs-", "-game", "-match", "-winner", "game-1", "game-2", "game-3",
+    "game-4", "game-5", "game-6", "game-7", "round-", "set-",
+]
+
 
 @dataclass
 class Position:
@@ -135,8 +179,8 @@ class MeanReversionBot(BaseBot):
 
     # Configuration
     DEFAULT_TRADE_SIZE = 10.0  # $10 per entry (x3 = $30 max per trade)
-    MIN_LIQUIDITY = 1000  # $1,000 minimum
-    MAX_LIQUIDITY = 50000  # $50,000 maximum
+    MIN_LIQUIDITY = 2000  # $2,000 minimum (avoid low liquidity noise)
+    MAX_LIQUIDITY = 100000  # $100,000 maximum
     WATCHLIST_REFRESH_INTERVAL = 300  # 5 minutes
     MAX_WATCHLIST_SIZE = 200
 
@@ -151,7 +195,7 @@ class MeanReversionBot(BaseBot):
     SLIPPAGE = 0.01  # 1% slippage on entry/exit
     MIN_HOLD_SECONDS = 10  # Minimum 10 seconds before exit
     MARKET_COOLDOWN_SECONDS = 300  # 5 min cooldown per market after closing
-    SPIKE_CONFIRMATION_SECONDS = 3  # Wait 3 seconds to confirm spike is real
+    SPIKE_CONFIRMATION_SECONDS = 0  # No delay - buy immediately on spike detection
 
     def __init__(
         self,
@@ -287,12 +331,13 @@ class MeanReversionBot(BaseBot):
                 max_markets=self.MAX_WATCHLIST_SIZE * 3,
             )
 
-            # Filter by liquidity range and binary
+            # Filter by liquidity range, binary, and exclude live sports
             filtered = [
                 m for m in markets
                 if m.is_binary
                 and m.accepting_orders
                 and self.min_liquidity <= m.liquidity <= self.max_liquidity
+                and not self._is_live_sports_market(m)
             ]
 
             # Sort by liquidity (prefer middle of range)
@@ -339,6 +384,67 @@ class MeanReversionBot(BaseBot):
         except Exception as e:
             self.logger.error("watchlist_refresh_error", error=str(e))
 
+    def _is_live_sports_market(self, market) -> bool:
+        """
+        Check if a market is a LIVE sports event (already started).
+
+        Mean reversion doesn't work on live sports because price changes
+        reflect actual game events (goals, points), not temporary order imbalances.
+
+        Note: Polymarket API returns timestamps in UTC (ISO 8601 with 'Z' suffix).
+
+        Returns:
+            True if this is a LIVE sports market (should be excluded)
+            False if it's not sports OR sports but hasn't started yet
+        """
+        slug = market.market_slug.lower()
+        question = market.question.lower()
+
+        # Check for sports keywords in slug or question
+        is_sports = any(kw in slug or kw in question for kw in SPORTS_KEYWORDS)
+
+        if not is_sports:
+            return False
+
+        # It's a sports market - check if it has started
+        # If start_date is in the past, it's potentially live
+        # Note: startDateIso is just a date "2025-12-22", not a full datetime
+        if market.start_date_iso:
+            try:
+                from datetime import date
+                # Parse as simple date (format: "2025-12-22")
+                start_date = date.fromisoformat(market.start_date_iso)
+                today = date.today()
+
+                if today > start_date:
+                    # Event date has passed - exclude it (already happened)
+                    self.logger.debug(
+                        "excluding_past_sports_market",
+                        slug=slug[:40],
+                        start_date=market.start_date_iso,
+                        status="past_event",
+                    )
+                    return True
+                else:
+                    # Event is today or future - allow trading
+                    # Note: We can't know exact start time, so we allow today's events
+                    return False
+            except (ValueError, TypeError) as e:
+                # Can't parse date - exclude to be safe
+                self.logger.debug(
+                    "excluding_sports_market_bad_date",
+                    slug=slug[:40],
+                    error=str(e),
+                )
+                return True
+
+        # No start_date available - exclude to be safe
+        self.logger.debug(
+            "excluding_sports_market_missing_start",
+            slug=slug[:40],
+        )
+        return True
+
     async def run_fast_loop(self) -> None:
         """Main loop - WebSocket driven."""
         # Start WebSocket if needed
@@ -383,11 +489,16 @@ class MeanReversionBot(BaseBot):
         for token_id, (spike, detect_time, initial_price) in self._pending_spikes.items():
             elapsed = (now - detect_time).total_seconds()
 
-            # Not ready yet
-            if elapsed < self.SPIKE_CONFIRMATION_SECONDS:
+            # Not ready yet (only if confirmation delay > 0)
+            if self.SPIKE_CONFIRMATION_SECONDS > 0 and elapsed < self.SPIKE_CONFIRMATION_SECONDS:
                 continue
 
-            # Get current price
+            # If no confirmation delay, buy immediately without validation
+            if self.SPIKE_CONFIRMATION_SECONDS == 0:
+                to_confirm.append((token_id, spike))
+                continue
+
+            # Get current price for validation (only when delay > 0)
             tracker = self.detector._trackers.get(token_id)
             if not tracker or not tracker.last_price:
                 to_remove.append(token_id)
@@ -476,33 +587,35 @@ class MeanReversionBot(BaseBot):
             self.metrics.inc("orderbook_updates")
 
     def _on_spike_detected(self, spike: PriceSpike) -> None:
-        """Handle detected price spike - add to pending for confirmation."""
+        """Handle detected price spike."""
         self._spikes_detected += 1
 
-        # Skip if already pending or has position
-        if spike.token_to_buy in self._pending_spikes:
-            return
+        # Skip if already has position for this token
         if spike.token_to_buy in self._positions:
             return
 
+        # Log spike detection
         self.logger.info(
-            "spike_detected_pending_confirmation",
+            "spike_detected",
             condition_id=spike.condition_id[:20] + "...",
             direction=spike.direction,
             change=f"{spike.price_change:.2%}",
-            token_to_buy=spike.token_to_buy[:20] + "...",
-            confirmation_seconds=self.SPIKE_CONFIRMATION_SECONDS,
         )
 
         if self.metrics:
             self.metrics.inc("spikes_detected")
 
-        # Add to pending spikes - will be confirmed after SPIKE_CONFIRMATION_SECONDS
-        self._pending_spikes[spike.token_to_buy] = (
-            spike,
-            datetime.utcnow(),
-            spike.price_after,  # Initial price at detection
-        )
+        # No confirmation delay - buy immediately
+        if self.SPIKE_CONFIRMATION_SECONDS == 0:
+            asyncio.create_task(self._open_position(spike))
+        else:
+            # Add to pending spikes for confirmation after delay
+            if spike.token_to_buy not in self._pending_spikes:
+                self._pending_spikes[spike.token_to_buy] = (
+                    spike,
+                    datetime.utcnow(),
+                    spike.price_after,
+                )
 
     async def _open_position(self, spike: PriceSpike) -> None:
         """Open a new mean reversion position."""
@@ -533,7 +646,9 @@ class MeanReversionBot(BaseBot):
             target_price=spike.target_price,
             stop_loss_price=spike.stop_loss_price,
             timeout_at=now + timedelta(minutes=self.POSITION_TIMEOUT_MINUTES),
-            min_exit_time=now + timedelta(seconds=self.MIN_HOLD_SECONDS),
+            # In dry-run: wait MIN_HOLD_SECONDS to avoid orderbook noise
+            # In real mode: no wait - market filters naturally via limit orders
+            min_exit_time=now + timedelta(seconds=self.MIN_HOLD_SECONDS if self.is_dry_run else 0),
         )
 
         self._positions[spike.token_to_buy] = position
@@ -639,7 +754,8 @@ class MeanReversionBot(BaseBot):
 
             # Sanity check: reject prices that differ too much from entry
             # This protects against bad data during initialization
-            if position.avg_entry_price > 0:
+            # ONLY applies to dry-run - in real mode, market filters naturally
+            if self.is_dry_run and position.avg_entry_price > 0:
                 price_diff_ratio = abs(current_price - position.avg_entry_price) / position.avg_entry_price
                 if price_diff_ratio > 0.5:  # More than 50% difference is suspicious
                     self.logger.warning(
@@ -752,6 +868,13 @@ class MeanReversionBot(BaseBot):
 
     def _serialize_position(self, position: Position) -> dict[str, Any]:
         """Serialize a position for TUI display."""
+        # Get entry time from first entry
+        entry_time = None
+        if position.entries:
+            first_entry = position.entries[0]
+            if isinstance(first_entry.get("timestamp"), datetime):
+                entry_time = first_entry["timestamp"].strftime("%H:%M:%S")
+
         return {
             "condition_id": position.condition_id,
             "token_id": position.token_id,
@@ -770,6 +893,7 @@ class MeanReversionBot(BaseBot):
             "spike_direction": position.spike.direction,  # Already a string
             "spike_magnitude": position.spike.price_change,  # Use price_change, not magnitude
             "entries": position.entries,
+            "entry_time": entry_time,  # First entry time for display
         }
 
     async def health_check(self) -> dict[str, Any]:

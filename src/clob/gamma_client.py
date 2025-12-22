@@ -66,6 +66,7 @@ class GammaMarket:
 
     # Timing
     end_date_iso: str | None
+    start_date_iso: str | None
 
     @property
     def is_binary(self) -> bool:
@@ -200,6 +201,7 @@ class GammaApiClient:
                 best_bid=best_bid,
                 best_ask=best_ask,
                 end_date_iso=m.get("endDateIso"),
+                start_date_iso=m.get("startDateIso"),
             ))
 
         self.logger.debug(

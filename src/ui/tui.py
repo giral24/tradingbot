@@ -38,10 +38,25 @@ except ImportError:
 
 # Event emojis for operations log
 EVENT_EMOJIS = {
+    # Spikes
     "spike_detected": "🔴",
+    "spike_detected_pending_confirmation": "🟡",
+    "spike_confirmed": "🟢",
+    "spike_rejected_price_reverted": "⏭️",
+    # Trades
     "executing_entry": "💵",
+    "position_opened": "📈",
     "position_closed": "💰",
+    # Status
     "watchlist_refreshed": "🔄",
+    "watchlist_refresh_scheduled": "⏰",
+    "ws_connected": "🔌",
+    "ws_disconnected": "❌",
+    "ws_reconnecting": "🔄",
+    "warmup_started": "⏳",
+    "warmup_complete": "✅",
+    "warmup_progress": "⏳",
+    # Arbitrage
     "arbitrage_opportunity": "💡",
     "executing_arbitrage": "💵",
     "arbitrage_executed": "💰",
@@ -332,16 +347,23 @@ class TUIDisplay:
                 Layout(name="footer", size=1),
             )
 
-            # Split body into stats and operations
+            # Split body into stats and main area
             layout["body"].split_row(
-                Layout(name="stats", ratio=30),
-                Layout(name="operations", ratio=70),
+                Layout(name="stats", ratio=25),
+                Layout(name="main", ratio=75),
+            )
+
+            # Split main area into positions (top) and logs (bottom)
+            layout["main"].split_column(
+                Layout(name="positions", ratio=60),
+                Layout(name="logs", ratio=40),
             )
 
             # Build components
             layout["header"].update(self._build_header())
             layout["stats"].update(self._build_stats_panel())
-            layout["operations"].update(self._build_operations_panel())
+            layout["positions"].update(self._build_operations_panel())
+            layout["logs"].update(self._build_logs_panel())
             layout["footer"].update(self._build_status_bar())
 
             return layout
@@ -536,11 +558,12 @@ class TUIDisplay:
 
         # Add columns with fixed widths
         table.add_column("", width=1, no_wrap=True)  # Cursor
-        table.add_column("Status", width=2, no_wrap=True)  # Emoji
-        table.add_column("Market", max_width=40)  # Market name
-        table.add_column("PnL", width=10, justify="right", no_wrap=True)
-        table.add_column("Size", width=12, justify="right", no_wrap=True)
-        table.add_column("Status", width=15, no_wrap=True)
+        table.add_column("", width=2, no_wrap=True)  # Emoji
+        table.add_column("Time", width=8, no_wrap=True)  # Entry time
+        table.add_column("Market", max_width=35)  # Market name
+        table.add_column("PnL", width=9, justify="right", no_wrap=True)
+        table.add_column("Size", width=10, justify="right", no_wrap=True)
+        table.add_column("Status", width=14, no_wrap=True)
 
         # Add rows
         for i, position in enumerate(positions):
@@ -577,6 +600,10 @@ class TUIDisplay:
             # Status emoji
             emoji = Text(status_emoji)
 
+            # Entry time
+            entry_time = position.get("entry_time", "")
+            time_text = Text(entry_time or "--:--", style="dim")
+
             # Market name (with expand indicator)
             market = Text(display_name, style="cyan")
             if is_expanded:
@@ -591,7 +618,7 @@ class TUIDisplay:
             # Status text
             status = Text(status_text, style=status_style)
 
-            table.add_row(cursor, emoji, market, pnl_text, size_text, status)
+            table.add_row(cursor, emoji, time_text, market, pnl_text, size_text, status)
 
             # Add expanded details if needed
             if is_expanded:
@@ -623,7 +650,7 @@ class TUIDisplay:
 
             for detail in details:
                 detail_text = Text(detail, style="dim")
-                table.add_row("", "", detail_text, "", "", "")
+                table.add_row("", "", "", detail_text, "", "", "")
         else:
             # Mean reversion position details
             details = []
@@ -637,7 +664,7 @@ class TUIDisplay:
 
             for detail in details:
                 detail_text = Text(detail, style="dim")
-                table.add_row("", "", detail_text, "", "", "")
+                table.add_row("", "", "", detail_text, "", "", "")
 
     def _build_position_line(
         self,
@@ -855,3 +882,51 @@ class TUIDisplay:
             status.append(f"Uptime: {format_uptime(elapsed)}", style="white")
 
         return status
+
+    def _build_logs_panel(self) -> Panel:
+        """
+        Build logs/operations panel showing recent events.
+
+        Returns:
+            Logs Panel
+        """
+        if not self._log_entries:
+            return Panel(
+                Text("Esperando eventos...", style="dim"),
+                title="📋 OPERACIONES",
+                border_style="cyan",
+            )
+
+        # Build log lines (most recent first)
+        log_lines = []
+        for entry in reversed(list(self._log_entries)):
+            line = Text()
+
+            # Timestamp
+            line.append(f"{entry['timestamp']} ", style="dim")
+
+            # Emoji
+            line.append(f"{entry['emoji']} ", style="white")
+
+            # Event name
+            event_name = entry['event'].replace("_", " ").upper()
+            line.append(f"{event_name}", style="cyan")
+
+            # Context (key details)
+            context = entry.get('context', {})
+            if context:
+                # Show most relevant context items
+                details = []
+                for key, value in list(context.items())[:3]:
+                    if key not in ('token_id', 'condition_id'):
+                        details.append(f"{key}={value}")
+                if details:
+                    line.append(f" ({', '.join(details)})", style="dim")
+
+            log_lines.append(line)
+
+        return Panel(
+            Group(*log_lines),
+            title="📋 OPERACIONES",
+            border_style="cyan",
+        )

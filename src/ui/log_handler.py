@@ -17,9 +17,21 @@ if TYPE_CHECKING:
 IMPORTANT_EVENTS = {
     # Mean Reversion Bot events
     "spike_detected",
+    "spike_detected_pending_confirmation",
+    "spike_confirmed",
+    "spike_rejected_price_reverted",
     "executing_entry",
     "position_closed",
+    "position_opened",
     "watchlist_refreshed",
+    # Connection & Status events
+    "ws_connected",
+    "ws_disconnected",
+    "ws_reconnecting",
+    "warmup_started",
+    "warmup_complete",
+    "warmup_progress",
+    "watchlist_refresh_scheduled",
     # Arbitrage Bot events
     "arbitrage_opportunity",
     "executing_arbitrage",

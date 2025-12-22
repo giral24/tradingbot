@@ -194,11 +194,32 @@ class PriceMovementDetector:
         if not tracker:
             return
 
+        # Track warmup state before update
+        was_warmed_up = tracker.is_warmed_up
+
         # Store previous baseline before updating
         old_baseline = tracker.baseline_price
 
         # Add new price
         tracker.add_price(price)
+
+        # Log warmup completion
+        if not was_warmed_up and tracker.is_warmed_up:
+            warmed_up_count = sum(1 for t in self._trackers.values() if t.is_warmed_up)
+            total_count = len(self._trackers)
+            self.logger.info(
+                "warmup_progress",
+                warmed_up=warmed_up_count,
+                total=total_count,
+                percent=f"{warmed_up_count/total_count*100:.0f}%",
+            )
+            # Log when all tokens are warmed up
+            if warmed_up_count == total_count:
+                self.logger.info(
+                    "warmup_complete",
+                    tokens=total_count,
+                    message="All tokens ready - spike detection active",
+                )
 
         # Check for spike
         if old_baseline is not None:
