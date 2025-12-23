@@ -15,7 +15,7 @@ from typing import Any
 from src.bots.base import BaseBot
 from src.config import settings
 from src.clob import ClobApiClient, GammaApiClient
-from src.clob.models import OrderSide
+from src.clob.models import OrderSide, OrderType
 from src.ws import WebSocketClient
 from src.metrics import MetricsCollector
 
@@ -171,10 +171,11 @@ class MeanReversionBot(BaseBot):
     Mean reversion trading bot.
 
     Strategy:
-    - Monitor markets for sudden price spikes (>=8% in <2 min)
-    - When detected, trade opposite direction (expect reversion)
-    - Scaled entry: 3 buys as price continues moving
-    - Exit at 50% recovery, 30 min timeout, or 5% stop-loss
+    - Monitor markets for sudden price DROPS (>=6% in <2 min)
+    - When detected, BUY the dropped token (expect recovery)
+    - Scaled entry: up to 3 buys as price continues dropping
+    - Exit at 60% recovery, 10 min timeout, or 10% stop-loss
+    - Uses FAK orders in real mode for fast execution
     """
 
     # Configuration
@@ -192,8 +193,8 @@ class MeanReversionBot(BaseBot):
     POSITION_TIMEOUT_MINUTES = 10
 
     # Realistic execution settings
-    SLIPPAGE = 0.01  # 2% slippage on entry/exit
-    MIN_HOLD_SECONDS = 5  # Minimum 10 seconds before exit
+    SLIPPAGE = 0.01  # 1% slippage on entry/exit
+    MIN_HOLD_SECONDS = 5  # Minimum 5 seconds before exit
     MARKET_COOLDOWN_SECONDS_LOSS = 300  # 5 min cooldown after loss
     MARKET_COOLDOWN_SECONDS_WIN = 0  # No cooldown after win
     SPIKE_CONFIRMATION_SECONDS = 0  # No delay - buy immediately on spike detection
@@ -327,9 +328,10 @@ class MeanReversionBot(BaseBot):
         self.logger.info("refreshing_watchlist")
 
         try:
-            # Fetch markets
+            # Fetch markets ordered by 24h volume (most active first)
             markets = await self.gamma_client.get_all_active_markets(
                 max_markets=self.MAX_WATCHLIST_SIZE * 3,
+                order_by="volume24hr",  # Most active markets first
             )
 
             # Filter by liquidity range, binary, and exclude live sports
@@ -341,9 +343,8 @@ class MeanReversionBot(BaseBot):
                 and not self._is_live_sports_market(m)
             ]
 
-            # Sort by liquidity (prefer middle of range)
-            target_liquidity = (self.min_liquidity + self.max_liquidity) / 2
-            filtered.sort(key=lambda m: abs(m.liquidity - target_liquidity))
+            # Sort by liquidity (prefer more liquid markets)
+            filtered.sort(key=lambda m: m.liquidity, reverse=True)
 
             # Take top N
             selected = filtered[:self.MAX_WATCHLIST_SIZE]
@@ -375,11 +376,17 @@ class MeanReversionBot(BaseBot):
 
             self._last_watchlist_refresh = datetime.utcnow()
 
+            # Log stats about selected markets
+            avg_volume = sum(m.volume_24h for m in selected) / len(selected) if selected else 0
+            avg_liquidity = sum(m.liquidity for m in selected) / len(selected) if selected else 0
+
             self.logger.info(
                 "watchlist_refreshed",
                 total_markets=len(selected),
                 tokens=len(new_tokens),
                 new_subs=len(to_sub),
+                avg_volume_24h=f"${avg_volume:,.0f}",
+                avg_liquidity=f"${avg_liquidity:,.0f}",
             )
 
         except Exception as e:
@@ -578,13 +585,14 @@ class MeanReversionBot(BaseBot):
         if not self.detector:
             return
 
-        # Extract best ask price (that's what we'd pay to buy)
+        # Extract prices from orderbook
         token_id = update.asset_id  # asset_id is the token ID
-        best_ask = update.best_ask
+        best_ask = update.best_ask  # Price to BUY
+        best_bid = update.best_bid  # Price to SELL
 
         if best_ask and best_ask > 0:
-            # Update detector (may trigger spike detection)
-            self.detector.update_price(token_id, best_ask)
+            # Update detector with both ask and bid (may trigger spike detection)
+            self.detector.update_price(token_id, best_ask, bid=best_bid)
 
             # Log price for tokens with open positions (for verification)
             if self.trade_logger and token_id in self._positions:
@@ -730,30 +738,109 @@ class MeanReversionBot(BaseBot):
             # Simulate entry WITH slippage (we pay more than the displayed price)
             entry_price_with_slippage = current_price * (1 + self.SLIPPAGE)
             position.add_entry(entry_price_with_slippage, entry_size)
+
+            # Recalculate target and stop_loss based on ACTUAL entry price
+            self._recalculate_exit_prices(position)
+
             self.logger.info(
                 "dry_run_entry_simulated",
                 orderbook_price=f"{current_price:.3f}",
                 entry_price_with_slippage=f"{entry_price_with_slippage:.3f}",
+                new_target=f"{position.target_price:.3f}",
+                new_stop_loss=f"{position.stop_loss_price:.3f}",
             )
             return
 
         try:
-            # Place buy order
+            # Use FAK (Fill-And-Kill) with price padding for better fill
+            # Add 0.5% to buy price to increase fill probability
+            padded_price = min(current_price * 1.005, 0.99)  # Cap at 0.99
+
             order = await self.clob_client.place_order(
                 token_id=position.token_id,
                 side=OrderSide.BUY,
-                price=current_price,
+                price=padded_price,
                 size=entry_size,
+                order_type=OrderType.FAK,  # Partial fills OK
             )
 
-            if order:
-                position.add_entry(current_price, entry_size)
+            if order and order.order_id:
+                # Wait briefly for order to process
+                await asyncio.sleep(0.5)
 
-                if self.metrics:
-                    self.metrics.inc("entries_executed")
+                # Verify actual fill
+                filled_order = await self.clob_client.get_order(order.order_id)
+
+                if filled_order and filled_order.filled_size > 0:
+                    # Use actual filled data
+                    actual_filled_usd = filled_order.filled_size * filled_order.price
+                    position.add_entry(filled_order.price, actual_filled_usd)
+
+                    # Recalculate target and stop_loss based on ACTUAL entry price
+                    self._recalculate_exit_prices(position)
+
+                    self.logger.info(
+                        "real_entry_verified",
+                        order_id=order.order_id,
+                        requested_size=entry_size,
+                        filled_size=filled_order.filled_size,
+                        fill_price=f"{filled_order.price:.4f}",
+                        fill_pct=f"{(filled_order.filled_size / (entry_size / padded_price)) * 100:.1f}%",
+                    )
+
+                    if self.metrics:
+                        self.metrics.inc("entries_executed")
+                else:
+                    self.logger.warning(
+                        "entry_order_no_fill",
+                        order_id=order.order_id,
+                        status=filled_order.status if filled_order else "unknown",
+                    )
+            else:
+                self.logger.warning(
+                    "entry_order_rejected",
+                    token_id=position.token_id[:20] + "...",
+                    price=f"{padded_price:.4f}",
+                )
 
         except Exception as e:
             self.logger.error("entry_execution_error", error=str(e))
+
+    def _recalculate_exit_prices(self, position: Position) -> None:
+        """
+        Recalculate target and stop_loss based on ACTUAL entry price.
+
+        This fixes the bug where targets were calculated from spike detection price
+        but entry happened at a different (often higher) price.
+
+        Logic:
+        - baseline = the "normal" price before the spike (spike.price_before)
+        - We want price to recover toward baseline from our actual entry
+        - target = entry + (baseline - entry) * recovery_target
+        - stop_loss = entry * (1 - stop_loss_pct)
+        """
+        baseline = position.spike.price_before
+        entry = position.avg_entry_price
+
+        # Target: recover X% of the way from entry toward baseline
+        # If entry < baseline (normal case): target > entry (we profit when price rises)
+        # If entry > baseline (entered too high): target could be < entry (we'd lose)
+        position.target_price = entry + (baseline - entry) * self.RECOVERY_TARGET
+
+        # Stop loss: exit if price drops X% below our entry
+        position.stop_loss_price = entry * (1 - self.STOP_LOSS)
+
+        # Safety check: target must be above entry for profit
+        # If we entered above baseline, the math gives us a losing target
+        # In that case, set a minimum profit target of 2%
+        if position.target_price <= entry:
+            self.logger.warning(
+                "target_below_entry_adjusting",
+                entry=f"{entry:.3f}",
+                baseline=f"{baseline:.3f}",
+                old_target=f"{position.target_price:.3f}",
+            )
+            position.target_price = entry * 1.02  # Minimum 2% profit target
 
     async def _check_positions(self) -> None:
         """Check all positions for exit conditions or additional entries."""
@@ -766,57 +853,78 @@ class MeanReversionBot(BaseBot):
             if position.closed:
                 continue
 
-            # Get current price from detector
+            # Get current prices from detector
             tracker = self.detector._trackers.get(token_id)
             if not tracker or not tracker.last_price:
                 continue
 
-            current_price = tracker.last_price
+            current_ask = tracker.last_price  # best_ask (for buying/logging)
+            current_bid = tracker.last_bid    # best_bid (for selling and target check)
+
+            # Need bid price to check exit - skip if not available
+            if not current_bid or current_bid <= 0:
+                continue
 
             # Sanity check: reject prices that differ too much from entry
             # This protects against bad data during initialization
             # ONLY applies to dry-run - in real mode, market filters naturally
             if self.is_dry_run and position.avg_entry_price > 0:
-                price_diff_ratio = abs(current_price - position.avg_entry_price) / position.avg_entry_price
+                price_diff_ratio = abs(current_bid - position.avg_entry_price) / position.avg_entry_price
                 if price_diff_ratio > 0.5:  # More than 50% difference is suspicious
                     self.logger.warning(
                         "rejecting_suspicious_price",
                         token_id=token_id,  # Full ID for debugging
                         avg_entry=f"{position.avg_entry_price:.3f}",
-                        current_price=f"{current_price:.3f}",
+                        current_bid=f"{current_bid:.3f}",
                         diff_ratio=f"{price_diff_ratio:.2%}",
                     )
                     # Skip this price update - wait for more reasonable data
                     continue
 
-            # Check for exit
-            should_exit, reason = position.check_exit(current_price)
+            # Check for exit using BID price (what we actually get when selling)
+            should_exit, reason = position.check_exit(current_bid)
 
             if should_exit:
-                positions_to_close.append((token_id, position, current_price, reason))
-            elif position.should_add_entry(current_price):
-                # Add scaled entry
+                # Pass both ask and bid prices for realistic exit
+                positions_to_close.append((token_id, position, current_ask, current_bid, reason))
+            elif position.should_add_entry(current_ask):
+                # Add scaled entry (use ask because we're BUYING)
                 await self._execute_entry(position)
 
         # Close positions
-        for token_id, position, price, reason in positions_to_close:
-            await self._close_position(position, price, reason)
+        for token_id, position, ask_price, bid_price, reason in positions_to_close:
+            await self._close_position(position, ask_price, bid_price, reason)
 
     async def _close_position(
         self,
         position: Position,
-        current_price: float,
+        ask_price: float,
+        bid_price: float | None,
         reason: str,
     ) -> None:
-        """Close a position."""
+        """
+        Close a position.
+
+        Args:
+            position: The position to close
+            ask_price: Current best_ask (used for real orders and logging)
+            bid_price: Current best_bid (used for realistic dry-run exit price)
+            reason: Why we're closing (target_reached, stop_loss, timeout)
+        """
         if not self.clob_client:
             return
 
         position.closed = True
         position.close_reason = reason
 
-        # Apply slippage on exit (we sell for less than displayed price)
-        exit_price_with_slippage = current_price * (1 - self.SLIPPAGE)
+        # For dry-run: use actual best_bid for realistic exit simulation
+        # For real: we'll place a sell order at market
+        if self.is_dry_run and bid_price is not None and bid_price > 0:
+            # Use actual best_bid - this is what you'd really get when selling
+            exit_price_with_slippage = bid_price * (1 - self.SLIPPAGE)
+        else:
+            # Fallback: estimate bid from ask with slippage
+            exit_price_with_slippage = ask_price * (1 - self.SLIPPAGE)
 
         # Calculate PnL correctly with slippage:
         # PnL = (exit_price_with_slippage * tokens) - total_usd_invested
@@ -857,8 +965,9 @@ class MeanReversionBot(BaseBot):
             reason=reason,
             entries=position.entries_made,
             avg_entry=f"{position.avg_entry_price:.3f}",
-            orderbook_price=f"{current_price:.3f}",
-            exit_price_with_slippage=f"{exit_price_with_slippage:.3f}",
+            best_ask=f"{ask_price:.3f}",
+            best_bid=f"{bid_price:.3f}" if bid_price else "N/A",
+            exit_price=f"{exit_price_with_slippage:.3f}",
             pnl=f"${position.pnl:.4f}",
             total_pnl=f"${self._total_pnl:.4f}",
             dry_run=self.is_dry_run,
@@ -872,13 +981,56 @@ class MeanReversionBot(BaseBot):
 
         if not self.is_dry_run:
             try:
-                # Sell position (sell all tokens)
-                await self.clob_client.place_order(
+                # Use FAK with price padding for faster fill
+                # Subtract 0.5% from sell price to increase fill probability
+                base_price = bid_price if bid_price and bid_price > 0 else ask_price
+                padded_sell_price = max(base_price * 0.995, 0.01)  # Floor at 0.01
+
+                order = await self.clob_client.place_order(
                     token_id=position.token_id,
                     side=OrderSide.SELL,
-                    price=current_price,
-                    size=position.total_tokens,  # Sell tokens, not USD
+                    price=padded_sell_price,
+                    size=position.total_tokens,
+                    order_type=OrderType.FAK,  # Partial fills OK
                 )
+
+                if order and order.order_id:
+                    # Wait briefly for order to process
+                    await asyncio.sleep(0.5)
+
+                    # Verify actual fill
+                    filled_order = await self.clob_client.get_order(order.order_id)
+
+                    if filled_order and filled_order.filled_size > 0:
+                        self.logger.info(
+                            "real_exit_verified",
+                            order_id=order.order_id,
+                            requested_tokens=position.total_tokens,
+                            filled_tokens=filled_order.filled_size,
+                            fill_price=f"{filled_order.price:.4f}",
+                            fill_pct=f"{(filled_order.filled_size / position.total_tokens) * 100:.1f}%",
+                        )
+
+                        # If partial fill, log warning about remaining tokens
+                        if filled_order.filled_size < position.total_tokens * 0.95:
+                            remaining = position.total_tokens - filled_order.filled_size
+                            self.logger.warning(
+                                "partial_exit_fill",
+                                remaining_tokens=remaining,
+                                note="Some tokens may still be in wallet",
+                            )
+                    else:
+                        self.logger.warning(
+                            "exit_order_no_fill",
+                            order_id=order.order_id,
+                            status=filled_order.status if filled_order else "unknown",
+                        )
+                else:
+                    self.logger.warning(
+                        "exit_order_rejected",
+                        token_id=position.token_id[:20] + "...",
+                        price=f"{padded_sell_price:.4f}",
+                    )
             except Exception as e:
                 self.logger.error("close_execution_error", error=str(e))
 

@@ -396,7 +396,7 @@ class ClobApiClient:
             OrderType.GTC: ClobOrderType.GTC,
             OrderType.GTD: ClobOrderType.GTD,
             OrderType.FOK: ClobOrderType.FOK,
-            OrderType.FAK: ClobOrderType.FOK,  # FAK not in py-clob-client, use FOK
+            OrderType.FAK: ClobOrderType.FAK,  # Fill-And-Kill (partial fills OK)
         }.get(order_type, ClobOrderType.GTC)
 
         # Create order
@@ -491,6 +491,42 @@ class ClobApiClient:
         self.logger.info("orders_cancelled", count=len(cancelled))
 
         return len(cancelled)
+
+    async def get_order(self, order_id: str) -> Order | None:
+        """
+        Get a specific order by ID.
+
+        Args:
+            order_id: The order ID to fetch
+
+        Returns:
+            Order object or None if not found
+        """
+        self._check_auth()
+        client = self._get_client()
+
+        try:
+            result = await self._retry_async(
+                client.get_order,
+                order_id,
+            )
+
+            if not result:
+                return None
+
+            return Order(
+                order_id=result.get("id", order_id),
+                market_id=result.get("market", ""),
+                token_id=result.get("asset_id", ""),
+                side=OrderSide(result.get("side", "BUY").upper()),
+                price=float(result.get("price", 0)),
+                size=float(result.get("original_size", 0)),
+                filled_size=float(result.get("size_matched", 0)),
+                status=result.get("status", "unknown"),
+            )
+        except Exception as e:
+            self.logger.warning("get_order_failed", order_id=order_id, error=str(e))
+            return None
 
     async def get_open_orders(self) -> list[Order]:
         """

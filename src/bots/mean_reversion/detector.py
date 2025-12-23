@@ -63,18 +63,21 @@ class TokenPriceTracker:
     history: deque = field(default_factory=lambda: deque(maxlen=300))
 
     # Current state
-    last_price: float | None = None
+    last_price: float | None = None  # Last best_ask (for buying)
+    last_bid: float | None = None    # Last best_bid (for selling)
     baseline_price: float | None = None  # Rolling average
 
     # Warmup tracking
     first_price_time: datetime | None = None
     is_warmed_up: bool = False
 
-    def add_price(self, price: float, timestamp: datetime | None = None) -> None:
+    def add_price(self, price: float, bid: float | None = None, timestamp: datetime | None = None) -> None:
         """Add a new price observation."""
         ts = timestamp or datetime.utcnow()
         self.history.append(PricePoint(price=price, timestamp=ts))
         self.last_price = price
+        if bid is not None:
+            self.last_bid = bid
 
         # Track first price time for warmup
         if self.first_price_time is None:
@@ -187,11 +190,16 @@ class PriceMovementDetector:
                 other_token_id=token_a_id,
             )
 
-    def update_price(self, token_id: str, price: float) -> None:
+    def update_price(self, token_id: str, price: float, bid: float | None = None) -> None:
         """
         Update price for a token and check for spikes.
 
         Called on each orderbook update.
+
+        Args:
+            token_id: The token to update
+            price: The best_ask price (what you pay to buy)
+            bid: The best_bid price (what you get when selling)
         """
         tracker = self._trackers.get(token_id)
         if not tracker:
@@ -203,8 +211,8 @@ class PriceMovementDetector:
         # Store previous baseline before updating
         old_baseline = tracker.baseline_price
 
-        # Add new price
-        tracker.add_price(price)
+        # Add new price (with bid for selling)
+        tracker.add_price(price, bid=bid)
 
         # Log warmup completion
         if not was_warmed_up and tracker.is_warmed_up:
