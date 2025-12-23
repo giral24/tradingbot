@@ -339,6 +339,7 @@ class MeanReversionBot(BaseBot):
                 m for m in markets
                 if m.is_binary
                 and m.accepting_orders
+                and not m.closed  # Exclude closed markets (API sometimes returns them)
                 and self.min_liquidity <= m.liquidity <= self.max_liquidity
                 and not self._is_live_sports_market(m)
             ]
@@ -864,22 +865,6 @@ class MeanReversionBot(BaseBot):
             # Need bid price to check exit - skip if not available
             if not current_bid or current_bid <= 0:
                 continue
-
-            # Sanity check: reject prices that differ too much from entry
-            # This protects against bad data during initialization
-            # ONLY applies to dry-run - in real mode, market filters naturally
-            if self.is_dry_run and position.avg_entry_price > 0:
-                price_diff_ratio = abs(current_bid - position.avg_entry_price) / position.avg_entry_price
-                if price_diff_ratio > 0.5:  # More than 50% difference is suspicious
-                    self.logger.warning(
-                        "rejecting_suspicious_price",
-                        token_id=token_id,  # Full ID for debugging
-                        avg_entry=f"{position.avg_entry_price:.3f}",
-                        current_bid=f"{current_bid:.3f}",
-                        diff_ratio=f"{price_diff_ratio:.2%}",
-                    )
-                    # Skip this price update - wait for more reasonable data
-                    continue
 
             # Check for exit using BID price (what we actually get when selling)
             should_exit, reason = position.check_exit(current_bid)
