@@ -69,6 +69,9 @@ class GammaMarket:
     start_date_iso: str | None
     game_start_time: str | None  # Exact start time for sports (ISO format)
 
+    # Special market types
+    neg_risk: bool = False  # Negative risk markets have special token relationships
+
     @property
     def is_binary(self) -> bool:
         """Check if this is a binary (2-outcome) market."""
@@ -204,6 +207,7 @@ class GammaApiClient:
                 end_date_iso=m.get("endDateIso"),
                 start_date_iso=m.get("startDateIso"),
                 game_start_time=m.get("gameStartTime"),
+                neg_risk=m.get("negRisk", False) or m.get("negRiskAugmented", False),
             ))
 
         self.logger.debug(

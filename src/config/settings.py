@@ -26,6 +26,10 @@ class Settings(BaseSettings):
 
     # Wallet Configuration (API credentials derived automatically)
     private_key: str = Field(default="", description="Wallet private key")
+    polymarket_proxy_address: str = Field(
+        default="",
+        description="Polymarket proxy wallet address (shown under profile picture on polymarket.com)",
+    )
 
     # API Configuration
     clob_api_url: str = Field(

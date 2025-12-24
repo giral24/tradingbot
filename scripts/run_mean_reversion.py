@@ -72,7 +72,8 @@ async def main(args):
         print("   MEAN REVERSION BOT")
         print("=" * 60)
         print(f"\n   Mode: {'DRY RUN (no real trades)' if args.dry_run else 'LIVE TRADING'}")
-        print(f"   Trade size: ${args.trade_size} per entry (max 3 entries)")
+        print(f"   Trade size: min(5 tokens, $1) per entry")
+        print(f"   Max exposure: ${args.max_exposure:.2f} total")
         print(f"   Price threshold: {args.threshold * 100:.1f}% movement")
         print(f"   Liquidity range: ${args.min_liquidity:,} - ${args.max_liquidity:,}")
         print(f"   Duration: {args.duration}s" if args.duration else "   Duration: unlimited")
@@ -80,7 +81,7 @@ async def main(args):
 
     # Create bot
     bot = MeanReversionBot(
-        trade_size=args.trade_size,
+        max_exposure=args.max_exposure,
         min_liquidity=args.min_liquidity,
         max_liquidity=args.max_liquidity,
         price_change_threshold=args.threshold,
@@ -164,14 +165,10 @@ async def main(args):
         # Final stats
         health = await bot.health_check()
 
-        # Calculate win rate
-        closed = health['positions_closed']
-        win_rate = 0
-        if closed > 0:
-            # Estimate wins (positions with positive PnL)
-            # Since we don't track individual position results, estimate from total PnL
-            wins = int(closed * 0.7) if health['total_pnl'] > 0 else 0
-            win_rate = (wins / closed) * 100 if closed > 0 else 0
+        # Get real win rate from health check
+        win_rate = health.get('win_rate', 0)
+        wins = health.get('wins', 0)
+        losses = health.get('losses', 0)
 
         # Calculate time active
         elapsed = asyncio.get_event_loop().time() - start_time
@@ -188,7 +185,7 @@ async def main(args):
         print("   | Métrica           | Valor       |")
         print("   |-------------------|-------------|")
         print(f"   | PnL total         | ${health['total_pnl']:.2f}{'':>6} |")
-        print(f"   | Win rate          | {win_rate:.0f}%{'':>8} |")
+        print(f"   | Win rate          | {win_rate:.0f}% ({wins}W/{losses}L) |")
         print(f"   | Tiempo activo     | {time_active:<11} |")
         print(f"   | Spikes detectados | {health['spikes_detected']:<11} |")
         print(f"   | Posiciones        | {health['positions_closed']}/{health['positions_opened']:<10} |")
@@ -213,10 +210,10 @@ if __name__ == "__main__":
         help="Enable live trading (overrides --dry-run)",
     )
     parser.add_argument(
-        "--trade-size",
+        "--max-exposure",
         type=float,
         default=10.0,
-        help="Trade size in dollars per entry (default: 10.0)",
+        help="Maximum total USD invested at any time (default: 10.0)",
     )
     parser.add_argument(
         "--threshold",

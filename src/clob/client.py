@@ -13,7 +13,12 @@ from typing import Any
 
 import structlog
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
+from py_clob_client.clob_types import (
+    OrderArgs,
+    OrderType as ClobOrderType,
+    BalanceAllowanceParams,
+    AssetType,
+)
 
 from src.config import settings
 from src.clob.models import (
@@ -85,11 +90,39 @@ class ClobApiClient:
         """Get or create the CLOB client."""
         if self._client is None:
             if self.private_key:
-                self._client = ClobClient(
-                    self.api_url,
-                    key=self.private_key,
-                    chain_id=self.chain_id,
-                )
+                # Get wallet address from private key
+                from eth_account import Account
+                account = Account.from_key(self.private_key)
+                eoa_address = account.address
+
+                # For Magic/Email wallets, use the proxy address as funder
+                # The proxy address is shown under your profile picture on polymarket.com
+                proxy_address = settings.polymarket_proxy_address
+
+                if proxy_address:
+                    # Magic/Email wallet: use signature_type=1 with proxy as funder
+                    self._client = ClobClient(
+                        self.api_url,
+                        key=self.private_key,
+                        chain_id=self.chain_id,
+                        signature_type=1,  # Magic/Email wallet
+                        funder=proxy_address,  # Proxy address from Polymarket profile
+                    )
+                    self.logger.info(
+                        "using_magic_wallet",
+                        eoa=eoa_address[:10] + "...",
+                        proxy=proxy_address[:10] + "...",
+                    )
+                else:
+                    # EOA wallet: use signature_type=0 (direct wallet)
+                    self._client = ClobClient(
+                        self.api_url,
+                        key=self.private_key,
+                        chain_id=self.chain_id,
+                        signature_type=0,  # Direct EOA wallet
+                    )
+                    self.logger.info("using_eoa_wallet", wallet=eoa_address[:10] + "...")
+
                 # Set API credentials for authenticated requests
                 try:
                     creds = self._client.create_or_derive_api_creds()
@@ -348,7 +381,9 @@ class ClobApiClient:
     # =========================================================================
 
     def _check_auth(self) -> None:
-        """Check if client is authenticated."""
+        """Check if client is authenticated. Initializes client if needed."""
+        # Ensure client is initialized (which triggers authentication)
+        self._get_client()
         if not self._authenticated:
             raise ClobApiError("Client not authenticated. Set PRIVATE_KEY in config.")
 
@@ -399,6 +434,31 @@ class ClobApiClient:
             OrderType.FAK: ClobOrderType.FAK,  # Fill-And-Kill (partial fills OK)
         }.get(order_type, ClobOrderType.GTC)
 
+        # Polymarket requirements:
+        # - price: max 2 decimals (0.01 increments)
+        # - size (tokens): integer or clean decimal to avoid precision issues
+        import math
+
+        # Round price to 2 decimals
+        price = round(float(price), 2)
+
+        # For size: round to integer to avoid any decimal precision issues
+        # This is the safest approach - buy whole tokens
+        size = math.ceil(float(size))
+
+        # Ensure minimum $1 order value
+        order_value = price * size
+        if order_value < 1.0 and price > 0:
+            # Calculate minimum tokens needed for $1
+            size = math.ceil(1.0 / price)
+
+        self.logger.debug(
+            "order_values_sanitized",
+            price=price,
+            size=size,
+            value=f"${price * size:.2f}",
+        )
+
         # Create order
         order_args = OrderArgs(
             token_id=token_id,
@@ -408,11 +468,20 @@ class ClobApiClient:
         )
 
         signed_order = client.create_order(order_args)
-        result = await self._retry_async(
-            client.post_order,
-            signed_order,
-            clob_order_type,
-        )
+        # No retry for orders - each order has unique signature
+        # Retrying causes "Duplicated" errors
+        try:
+            result = client.post_order(signed_order, clob_order_type)
+        except Exception as e:
+            self.logger.error(
+                "order_failed",
+                error=str(e),
+                token_id=token_id[:20] + "...",
+                side=side.value,
+                price=price,
+                size=size,
+            )
+            raise
 
         self.logger.info(
             "order_placed",
@@ -556,6 +625,36 @@ class ClobApiClient:
             ))
 
         return orders
+
+    async def get_balance(self) -> float:
+        """
+        Get USDC balance for the authenticated wallet.
+
+        Returns:
+            USDC balance as float
+        """
+        self._check_auth()
+        client = self._get_client()
+
+        try:
+            # Must provide BalanceAllowanceParams with asset_type and signature_type
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=1,  # Magic/Email wallet
+            )
+            result = await self._retry_async(
+                client.get_balance_allowance,
+                params,
+            )
+
+            # get_balance_allowance returns dict with 'balance' key (as string)
+            balance = result.get("balance", "0")
+            # Balance is in wei (6 decimals for USDC), convert to USD
+            return float(balance) / 1_000_000 if balance else 0.0
+
+        except Exception as e:
+            self.logger.warning("get_balance_failed", error=str(e))
+            return 0.0
 
     # =========================================================================
     # Health Check

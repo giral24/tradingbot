@@ -371,10 +371,13 @@ class WebSocketClient:
             asks.sort(key=lambda x: x[0])
 
             # Create update object
+            timestamp = data.get("timestamp")
+            timestamp_int = int(timestamp) if timestamp is not None else 0
+
             update = OrderBookUpdate(
                 asset_id=data.get("asset_id", ""),
                 market=data.get("market", ""),
-                timestamp=int(data.get("timestamp", 0)),
+                timestamp=timestamp_int,
                 bids=bids,
                 asks=asks,
             )
@@ -390,13 +393,14 @@ class WebSocketClient:
         """
         Handle price change event.
 
-        These are incremental updates with new price info.
-        Format: {"market": "...", "price_changes": [{"asset_id": "...", "price": "0.5"}, ...], ...}
+        These events have price but no real bid/ask spread.
+        We pass them with bid=None so the bot can filter them if needed.
         """
         try:
             price_changes = data.get("price_changes", [])
             market = data.get("market", "")
-            timestamp = int(data.get("timestamp", 0))
+            timestamp = data.get("timestamp")
+            timestamp_int = int(timestamp) if timestamp is not None else 0
 
             for change in price_changes:
                 asset_id = change.get("asset_id", "")
@@ -406,12 +410,14 @@ class WebSocketClient:
                     continue
 
                 price_float = float(price)
+
+                # Send with asks only (no bids) - bot will know this is price_change data
                 update = OrderBookUpdate(
                     asset_id=asset_id,
                     market=market,
-                    timestamp=timestamp,
-                    bids=[(price_float, 0)],
-                    asks=[(price_float, 0)],
+                    timestamp=timestamp_int,
+                    bids=[],  # Empty bids = no bid data
+                    asks=[(price_float, 0)] if price_float > 0 else [],
                 )
 
                 if self.on_orderbook:

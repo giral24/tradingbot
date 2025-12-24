@@ -447,13 +447,16 @@ class TUIDisplay:
         pnl = self._last_health.get("total_pnl", 0.0)
         table.add_row("PnL Total", format_pnl(pnl))
 
-        # Win Rate (estimated)
-        closed = self._last_health.get("positions_closed", 0)
-        if closed > 0 and pnl > 0:
-            win_rate = int(closed * 0.7) / closed * 100 if closed > 0 else 0
-            table.add_row("Win Rate", Text(f"{win_rate:.0f}%", style="green"))
+        # Win Rate (calculated from closed positions)
+        closed_positions = self._last_health.get("closed_positions", [])
+        if closed_positions:
+            wins = sum(1 for p in closed_positions if p.get("pnl", 0) > 0)
+            total = len(closed_positions)
+            win_rate = (wins / total) * 100 if total > 0 else 0
+            style = "green" if win_rate >= 50 else "red"
+            table.add_row("Win Rate", Text(f"{win_rate:.0f}%", style=style))
         else:
-            table.add_row("Win Rate", Text("0%", style="white"))
+            table.add_row("Win Rate", Text("-", style="white"))
 
         # Uptime
         if self.start_time:
@@ -465,6 +468,7 @@ class TUIDisplay:
         table.add_row("Spikes", Text(str(spikes), style="yellow"))
 
         # Positions (closed/opened/active)
+        closed = self._last_health.get("positions_closed", 0)
         opened = self._last_health.get("positions_opened", 0)
         active = self._last_health.get("active_positions", 0)
         positions_text = f"{closed}/{opened}/{active}"
@@ -658,10 +662,10 @@ class TUIDisplay:
         else:
             # Mean reversion position details
             details = []
-            details.append(f"  Avg Entry: ${position.get('avg_entry_price', 0):.4f}")
-            details.append(f"  Target: ${position.get('target_price', 0):.4f}")
-            details.append(f"  Stop Loss: ${position.get('stop_loss_price', 0):.4f}")
-            details.append(f"  Total Tokens: {position.get('total_tokens', 0):.4f}")
+            details.append(f"  Avg Entry: ${position.get('avg_entry_price', 0):.2f}")
+            details.append(f"  Target: ${position.get('target_price', 0):.2f}")
+            details.append(f"  Stop Loss: ${position.get('stop_loss_price', 0):.2f}")
+            details.append(f"  Total Tokens: {position.get('total_tokens', 0):.2f}")
 
             if position.get('spike_direction'):
                 details.append(f"  Spike: {position.get('spike_direction', 'N/A')} {position.get('spike_magnitude', 0):.1%}")
@@ -774,10 +778,10 @@ class TUIDisplay:
             else:
                 # Mean reversion position details
                 details = []
-                details.append(f"  Avg Entry: ${position.get('avg_entry_price', 0):.4f}")
-                details.append(f"  Target: ${position.get('target_price', 0):.4f}")
-                details.append(f"  Stop Loss: ${position.get('stop_loss_price', 0):.4f}")
-                details.append(f"  Total Tokens: {position.get('total_tokens', 0):.4f}")
+                details.append(f"  Avg Entry: ${position.get('avg_entry_price', 0):.2f}")
+                details.append(f"  Target: ${position.get('target_price', 0):.2f}")
+                details.append(f"  Stop Loss: ${position.get('stop_loss_price', 0):.2f}")
+                details.append(f"  Total Tokens: {position.get('total_tokens', 0):.2f}")
 
                 if position.get('spike_direction'):
                     details.append(f"  Spike: {position.get('spike_direction', 'N/A')} {position.get('spike_magnitude', 0):.1%}")

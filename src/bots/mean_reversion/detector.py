@@ -71,11 +71,25 @@ class TokenPriceTracker:
     first_price_time: datetime | None = None
     is_warmed_up: bool = False
 
+    # Spike validation - track price stability
+    last_update_time: datetime | None = None
+    consecutive_stable_updates: int = 0  # Count updates where price is stable
+
     def add_price(self, price: float, bid: float | None = None, timestamp: datetime | None = None) -> None:
         """Add a new price observation."""
         ts = timestamp or datetime.utcnow()
+
+        # Track price stability (for spike validation)
+        if self.last_price is not None:
+            price_change = abs(price - self.last_price) / self.last_price if self.last_price > 0 else 0
+            if price_change < 0.02:  # Less than 2% change = stable
+                self.consecutive_stable_updates += 1
+            else:
+                self.consecutive_stable_updates = 0
+
         self.history.append(PricePoint(price=price, timestamp=ts))
         self.last_price = price
+        self.last_update_time = ts
         if bid is not None:
             self.last_bid = bid
 
@@ -139,11 +153,11 @@ class PriceMovementDetector:
     - Signal opportunity to buy the opposite direction
     """
 
-    # Configuration
+    # Configuration (defaults - overridden by bot.py)
     PRICE_CHANGE_THRESHOLD = 0.08  # 8% minimum movement
     TIME_WINDOW_SECONDS = 120  # Movement must happen within 2 minutes
     RECOVERY_TARGET = 0.50  # Exit when price recovers 50%
-    STOP_LOSS = 0.05  # Exit if price moves 5% against us
+    STOP_LOSS = 0.07  # Exit if price moves 7% against us
 
     def __init__(
         self,
@@ -189,6 +203,16 @@ class PriceMovementDetector:
                 condition_id=condition_id,
                 other_token_id=token_a_id,
             )
+
+    def unregister_tokens(self, token_ids: set[str]) -> None:
+        """Remove tokens from tracking (when they leave watchlist)."""
+        for token_id in token_ids:
+            # Clear from trackers
+            if token_id in self._trackers:
+                del self._trackers[token_id]
+            # Clear any active spikes for this token
+            if token_id in self._active_spikes:
+                del self._active_spikes[token_id]
 
     def update_price(self, token_id: str, price: float, bid: float | None = None) -> None:
         """
@@ -274,8 +298,29 @@ class PriceMovementDetector:
         if abs(change) < self.price_change_threshold:
             return
 
-        # Reject unrealistic drops (>50% is almost certainly bad data)
-        if abs(change) > 0.50:
+        # === NEW VALIDATIONS TO REJECT FALSE SPIKES ===
+
+        # 1. Reject prices outside tradeable range (illiquid tokens)
+        if current < 0.05 or current > 0.95:
+            self.logger.debug(
+                "rejecting_illiquid_price",
+                token_id=tracker.token_id[:20] + "...",
+                current=f"{current:.3f}",
+                reason="price outside 0.05-0.95 range",
+            )
+            return
+
+        # 2. Reject if baseline is also in illiquid range
+        if baseline < 0.05 or baseline > 0.95:
+            self.logger.debug(
+                "rejecting_illiquid_baseline",
+                token_id=tracker.token_id[:20] + "...",
+                baseline=f"{baseline:.3f}",
+            )
+            return
+
+        # 3. Reject unrealistic drops (>40% is almost certainly bad data or multi-token confusion)
+        if abs(change) > 0.40:
             self.logger.debug(
                 "rejecting_unrealistic_drop",
                 token_id=tracker.token_id[:20] + "...",
@@ -284,6 +329,47 @@ class PriceMovementDetector:
                 current=f"{current:.3f}",
             )
             return
+
+        # 4. Reject if we don't have enough history (baseline might be unreliable)
+        if len(tracker.history) < 15:
+            self.logger.debug(
+                "rejecting_insufficient_history",
+                token_id=tracker.token_id[:20] + "...",
+                history_len=len(tracker.history),
+            )
+            return
+
+        # 5. Reject if price was already volatile (not a sudden spike, just noisy data)
+        # We want spikes from STABLE prices, not already-moving prices
+        if tracker.consecutive_stable_updates < 3:
+            self.logger.debug(
+                "rejecting_already_volatile",
+                token_id=tracker.token_id[:20] + "...",
+                stable_updates=tracker.consecutive_stable_updates,
+            )
+            return
+
+        # 6. Require bid price to exist and be reasonable (confirms real liquidity)
+        if tracker.last_bid is None or tracker.last_bid <= 0:
+            self.logger.debug(
+                "rejecting_no_bid",
+                token_id=tracker.token_id[:20] + "...",
+            )
+            return
+
+        # 7. Check bid-ask spread isn't too wide (>20% spread = illiquid)
+        spread = (current - tracker.last_bid) / current if current > 0 else 1.0
+        if spread > 0.20:
+            self.logger.debug(
+                "rejecting_wide_spread",
+                token_id=tracker.token_id[:20] + "...",
+                ask=f"{current:.3f}",
+                bid=f"{tracker.last_bid:.3f}",
+                spread=f"{spread:.1%}",
+            )
+            return
+
+        # === END NEW VALIDATIONS ===
 
         # Check if we already have an active spike for this token OR its complement
         if tracker.token_id in self._active_spikes:
